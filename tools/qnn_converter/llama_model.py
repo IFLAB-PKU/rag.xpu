@@ -380,8 +380,6 @@ class LlamaAttention(nn.Module):
        
 
         ### lsh 修改 
-        # 这里怪的很，注释掉就不报错，不注释掉就报
-        # [ ERROR ] QnnModel::addNode() validating node rms_norm_2 failed.[ ERROR ] model.addNode(..., "RmsNorm", ...) ... got MODEL_GRAPH_OP_VALIDATION_ERROR
         if self.q_norm is not None and self.k_norm is not None:
             # Qwen3 逻辑: 投影 -> Norm -> RoPE
             queries = [self.rope(self.q_norm(q_head(attn_input)), rope_embeds) for q_head in self.q_heads]

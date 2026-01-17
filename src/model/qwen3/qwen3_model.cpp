@@ -179,7 +179,7 @@ auto Qwen3Model::compute_embedding(const std::vector<Token> &tokens, size_t batc
             
             if (use_qnn_lm_head) {
                 size   = llm_config.vocab_size;
-                x = g.qnn_forward(x, pos, mask, size, false /* lm_head */);
+                x = g.qnn_forward(x, batch_pos, mask, size, false /* lm_head */);
             }else{
                 // 调用 qnn_forward
                 // 注意：这里假设 qnn_forward 能正确处理 lm_head=false 的情况并返回 hidden states
