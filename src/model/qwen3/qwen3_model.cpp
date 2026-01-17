@@ -291,14 +291,27 @@ auto Qwen3Model::compute_rerank_score(const std::vector<Token> &tokens, size_t b
 
 #if defined(POWERSERVE_WITH_QNN)
         if (m_platform->qnn_backend) {
-            // TODO: Support QNN Reranker.
-            // Current QNN backend wrappers might optimize for Generation (LM Head).
-            // Reranker needs specific Output Head (Dim=2) + Softmax.
-            // For now, fall through or implement fallback if possible.
-            // If QNN is strictly required, we need g.qnn_forward variant that returns raw hidden states first.
-            // Assuming fallback to CPU path isn't automatically handled here without explicit logic.
-            // As per instruction, we keep the structure but focus on CPU.
-             POWERSERVE_LOG_WARN("QNN backend selected but Rerank QNN support is experimental/empty. Results might be incorrect.");
+            // NPU Backbone: Use QNN to calculate hidden states
+            // This corresponds to your qwen3_reranker_0.6b_x.bin binaries
+            auto size = llm_config.dim;
+            x = g.qnn_forward(x, batch_pos, mask, size, true /* lm_head=true */);
+            // [NOTE]: `lm_head=true` in order to satisfy qnn_forward's output size. Indeed we do not use lm_head.bin to compute logits. We want hidden states.
+
+            // CPU Tail: Manually attach the Rerank Head logic
+            // We intentionally ignore the QNN's lm_head.bin
+            // and use the precise valid metrics from GGUF (cls.output.weight 2x1024)
+            if (is_last_batch) {
+                // 1. Final RMS Norm (CPU)
+                auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
+                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+                
+                // 2. Output Projection to [Batch, 2] (CPU)
+                auto output_w       = g.add_tensor(m_weights->output_weight);
+                x                   = g.mat_mul(output_w, final_rms_norm);
+                
+                // 3. Softmax (CPU)
+                x                   = g.softmax(x);
+            }
         } else
 #endif
         if (!lazy_load) {
@@ -329,7 +342,9 @@ auto Qwen3Model::compute_rerank_score(const std::vector<Token> &tokens, size_t b
         // 4. Execution
         Executor executor(*m_platform, g);
         executor.allocate_buffers();
+        POWERSERVE_LOG_INFO("Rerank: Executing batch of size {}", current_bs);
         executor.run();
+        POWERSERVE_LOG_INFO("Rerank: Execution complete for batch size {}", current_bs);
 
 #if defined(POWERSERVE_WITH_QNN)
         if (!m_platform->qnn_backend)

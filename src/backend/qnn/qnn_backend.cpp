@@ -71,7 +71,23 @@ void QNNBackend::forward(
             const float *out_buf = (float *)batch.chunks.back()->output_buffer();
             size_t size          = batch_size * dim * sizeof(float);
 
-            if (batch.lm_head != nullptr) {
+            // [FIX] Determine if we should REALLY use the LM Head
+            bool use_lm_head_logic = (batch.lm_head != nullptr);
+
+            if (use_lm_head_logic && dst->n_elements() > 0) {
+                // Heuristic: If the destination buffer is significantly smaller than what the logits would require,
+                // we assume the user only wants the Hidden States (e.g., for Rerank)
+                size_t logits_total_bytes = batch_size * vocab_size * sizeof(float);
+                size_t dst_total_bytes    = dst->n_elements() * sizeof(float); // Total capacity of the graph node
+
+                // dst->n_elements() is the total capacity allocated by Executor based on Graph definition.
+                // If it's too small for logits, we must disable head.
+                if (dst_total_bytes < logits_total_bytes) {
+                     use_lm_head_logic = false;
+                }
+            }
+
+            if (use_lm_head_logic) {
                 batch.compute_logits();
                 out_buf = (float *)batch.lm_head->output_buffer();
                 size    = batch_size * vocab_size * sizeof(float);
@@ -81,7 +97,7 @@ void QNNBackend::forward(
             memcpy(dst_data_ptr, out_buf, size);
             PerfettoTrace::end();
 
-            if (batch.lm_head != nullptr) {
+            if (use_lm_head_logic) {
                 dst_data_ptr += batch_size * vocab_size;
             } else {
                 dst_data_ptr += batch_size * dim;
