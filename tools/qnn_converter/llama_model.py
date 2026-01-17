@@ -21,11 +21,22 @@ class ModelLoader:
                 self.tensor_map[name] = tensors.get_tensor(name)
 
     def contain(self, name: str) -> bool:
-        return name in self.tensor_map
+        if name in self.tensor_map:
+            return True
+        # Check for non-prefix version, e.g. Qwen3-Embedding
+        if name.startswith("model.") and name[6:] in self.tensor_map:
+            return True
+        return False
 
     def load(self, dest: nn.Module | torch.Tensor, name: str, transposed: bool = False):
         """Look up tensor in tensor map and copy data to destination tensor"""
 
+        # [FIX] Smart key lookup: try removing "model." prefix if original key is not found
+        if name not in self.tensor_map and name.startswith("model."):
+            fallback_name = name[6:]
+            if fallback_name in self.tensor_map:
+                name = fallback_name
+                
         tensor = self.tensor_map[name]
 
         target = None

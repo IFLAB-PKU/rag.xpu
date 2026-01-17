@@ -114,6 +114,14 @@ void collect_config(gguf_context *ctx, nlohmann::json &config) {
         config["is_reranker"] = false;
     }
 
+    // [NEW] Check for embedding flag
+    if (model_name.find("Embedding") != std::string::npos) {
+        config["is_embedding"] = true;
+    } else {
+        config["is_embedding"] = false;
+    }
+    
+
     { // embed_dim, ffn_dim, n_heads, n_kv_heads, n_layers, n_ctx
         config["embed_dim"]       = get_u32(ctx, get_arch_config("{}.embedding_length"));
         config["ffn_dim"]         = get_u32(ctx, get_arch_config("{}.feed_forward_length"));
