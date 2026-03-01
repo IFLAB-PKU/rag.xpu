@@ -14,6 +14,8 @@
 
 #include "platform.hpp"
 
+#include <algorithm>
+
 namespace powerserve {
 
 void Platform::init_ggml_backend(const std::shared_ptr<ModelConfig> &config, const HyperParams &hparams) {
@@ -34,7 +36,9 @@ size_t Platform::get_kv_position(std::string &model_id) const {
     size_t position = ggml_backends.at(model_id)->m_kv->kv_cache->position;
 #if defined(POWERSERVE_WITH_QNN)
     if (qnn_backend) {
-        position = qnn_backend->m_models[model_id]->kv_cache->position;
+        auto *qnn_kv = qnn_backend->get_kv_interface(model_id);
+        POWERSERVE_ASSERT(qnn_kv != nullptr, "model '{}' not found in qnn backend", model_id);
+        position = std::max(position, qnn_kv->position);
     }
 #endif
     return position;
@@ -44,7 +48,9 @@ void Platform::reset_kv_position(std::string &model_id) {
     ggml_backends[model_id]->m_kv->reset_kv_cache();
 #if defined(POWERSERVE_WITH_QNN)
     if (qnn_backend) {
-        qnn_backend->m_models[model_id]->reset_kv_cache();
+        auto model_iter = qnn_backend->m_models.find(model_id);
+        POWERSERVE_ASSERT(model_iter != qnn_backend->m_models.end(), "model '{}' not found in qnn backend", model_id);
+        model_iter->second->reset_kv_cache();
     }
 #endif
 }

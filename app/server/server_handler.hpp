@@ -312,6 +312,15 @@ public:
         } else {
             std::shared_ptr<powerserve::Model> draft_model =
                 init_model(draft_model_path, workspace_config.hyper_params);
+#if defined(POWERSERVE_WITH_QNN)
+            // Speculative decoding still relies on QNN KV interface operations (copy/move/mask).
+            auto *main_qnn_kv  = m_platform_ptr->qnn_backend->get_kv_interface(main_model->m_config->model_id);
+            auto *draft_qnn_kv = m_platform_ptr->qnn_backend->get_kv_interface(draft_model->m_config->model_id);
+            POWERSERVE_ASSERT(main_qnn_kv != nullptr);
+            POWERSERVE_ASSERT(draft_qnn_kv != nullptr);
+            main_model->kv_cache  = main_qnn_kv;
+            draft_model->kv_cache = draft_qnn_kv;
+#endif // POWERSERVE_WITH_QNN
             m_context_slot_map[model_name] =
                 ModelContext(workspace_config, std::move(main_model), std::move(draft_model), std::move(tokenizer_ptr));
         }
@@ -428,6 +437,8 @@ private:
 
         model_ptr->m_platform = m_platform_ptr;
         m_platform_ptr->init_ggml_backend(model_ptr->m_config, hyper_params);
+        model_ptr->kv_cache = m_platform_ptr->ggml_backends[model_ptr->m_config->model_id]->m_kv->kv_cache.get();
+        POWERSERVE_ASSERT(model_ptr->kv_cache != nullptr);
 
         model_ptr->m_attn = std::make_shared<powerserve::NormAttention>(model_ptr->m_config->llm, model_ptr->m_weights);
         POWERSERVE_LOG_INFO("after attn init: {}", powerserve::perf_get_mem_result());
@@ -436,8 +447,6 @@ private:
         m_platform_ptr->qnn_backend->load_model(
             model_path / powerserve::qnn::QNN_WORKSPACE_DIR_NAME, model_ptr->m_config
         );
-        model_ptr->kv_cache =
-            model_ptr->m_platform->qnn_backend->m_models[model_ptr->m_config->model_id]->kv_cache.get();
 #endif // POWERSERVE_WITH_QNN
 
         m_model_map[model_path] = model_ptr;
