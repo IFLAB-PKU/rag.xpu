@@ -196,6 +196,10 @@ void GGMLBackend::get_embedding(const Tensor *dst, const Tensor *weight, const s
             memcpy(dst_tb + i * dim, src, dim * sizeof(float));
         } break;
 
+        case DataType::FP16: {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *)src, dst_tb + i * dim, dim);
+        } break;
+
         case DataType::GGML_Q4_0: {
             dequantize_row_q4_0((block_q4_0 *)src, dst_tb + i * dim, dim);
         } break;
