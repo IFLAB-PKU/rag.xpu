@@ -325,13 +325,17 @@ void OpenCLBackend::copy(const Tensor* dst, const Tensor* src) const {
         auto &staging_buf = staging.get<OpenCLBuffer>();
         cl_mem staging_mem = staging_buf.get_device_buffer();
         const size_t st_off = staging_buf.get_base_offset();
-        if (!memory_pool->copy_host_to_device(staging_mem, host_src, src_bytes, st_off)) {
+        cl_event h2d_event = nullptr;
+        if (!memory_pool->copy_host_to_device_async(staging_mem, host_src, src_bytes, st_off, 0, nullptr, &h2d_event)) {
             POWERSERVE_LOG_ERROR("H2D: staging copy_host_to_device failed");
             dump_backtrace();
             std::abort();
         }
 
-        cpy_tensor_cl(this, &staging, dst);
+        cpy_tensor_cl(this, &staging, dst, h2d_event ? 1u : 0u, h2d_event ? &h2d_event : nullptr, nullptr);
+        if (h2d_event) {
+            clReleaseEvent(h2d_event);
+        }
         return;
     }
 
