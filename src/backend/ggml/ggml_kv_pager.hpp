@@ -53,6 +53,7 @@ public:
     bool evict_layer_async(size_t layer_id, size_t valid_tokens, bool do_sync);
     bool wait_layer_evicted(size_t layer_id);
     bool wait_all_async();
+    bool wait_all_evictions();
 
     bool acquire_layer(size_t layer_id, size_t need_tokens);
     void mark_dirty_layer(size_t layer_id);
@@ -76,7 +77,7 @@ private:
     int m_fd = -1;
     std::string m_file_path;
 
-    size_t m_n_layers = 0;
+    size_t m_n_layers = 0;     
     size_t m_n_ctx = 0;
     size_t m_kv_dim = 0;
     size_t m_layer_bytes = 0;
