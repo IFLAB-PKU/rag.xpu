@@ -122,6 +122,16 @@ struct ModelOutput {
     std::optional<std::string> m_stop_reason;
 };
 
+// Contract object for future P->D handoff. No behavior is wired yet.
+struct PrefillArtifact {
+    size_t request_id;
+    std::string model_id;
+    size_t num_prefill_tokens;
+    std::optional<powerserve::Token> last_prompt_token;
+    std::pair<size_t, size_t> kv_position_range;
+    std::optional<std::string> stop_reason;
+};
+
 using ServerSessionId = int;
 
 struct ServerSession {
