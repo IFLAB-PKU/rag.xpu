@@ -566,7 +566,10 @@ inline void stream_inference(const ModelContext &context, ServerSession &session
      * Prefill
      */
     Timer timer;
+    Timer total_timer;
     const size_t num_prefill_token = tokenizer.tokenize(input_prompt, tokenizer.m_vocab.tokenizer_add_bos).size() - 1;
+    bool first_chunk_emitted       = false;
+    double ttft_ms                 = -1.0;
 
     bool end_of_text = false;
     std::string output_buffer;
@@ -610,6 +613,10 @@ inline void stream_inference(const ModelContext &context, ServerSession &session
         } else {
             output_buffer += tokenizer.to_string(token);
             if (!is_utf8_string_incomplete(output_buffer)) {
+                if (!first_chunk_emitted) {
+                    first_chunk_emitted = true;
+                    ttft_ms             = static_cast<double>(total_timer.elapsed_time_ms());
+                }
                 session.m_result_queue.enqueue(
                     {.m_text             = output_buffer,
                      .m_input_num_token  = num_prefill_token,
@@ -631,8 +638,23 @@ inline void stream_inference(const ModelContext &context, ServerSession &session
     );
 
     const size_t decode_time_ms = timer.elapsed_time_ms();
+    const size_t total_time_ms  = total_timer.elapsed_time_ms();
+    const size_t decode_steps   = step > 1 ? step - 1 : 0;
+    const double prefill_tps    = prefill_time_ms > 0 ? num_prefill_token * 1000.0 / prefill_time_ms : 0.0;
+    const double decode_tps     = decode_time_ms > 0 ? decode_steps * 1000.0 / decode_time_ms : 0.0;
+
     POWERSERVE_LOG_INFO(
         "decode  step: {}, decode  time: {}ms ({} token/s)", step, decode_time_ms, step * 1000.f / decode_time_ms
+    );
+    POWERSERVE_LOG_INFO(
+        "request metrics: request_id={}, T_total_ms={}, T_prefill_ms={}, T_decode_ms={}, TTFT_ms={}, decode_tps={}, prefill_tps={}",
+        input.request_id,
+        total_time_ms,
+        prefill_time_ms,
+        decode_time_ms,
+        ttft_ms,
+        decode_tps,
+        prefill_tps
     );
 }
 
@@ -673,9 +695,11 @@ inline ModelOutput blocking_inference(
      * Prefill
      */
     Timer timer;
+    Timer total_timer;
     bool add_special_tokens = tokenizer.m_vocab.tokenizer_add_bos || tokenizer.m_vocab.tokenizer_add_eos;
     const size_t num_prefill_token = tokenizer.tokenize(input_prompt,add_special_tokens).size() - 1;
     bool end_of_text               = false;
+    double ttft_ms                 = -1.0;
 
     std::shared_ptr<powerserve::TokenIterator> iter = nullptr;
 #if defined(POWERSERVE_WITH_QNN)
@@ -715,7 +739,11 @@ inline ModelOutput blocking_inference(
             stop_reason = "stop";
             break;
         } else {
-            output_text += tokenizer.to_string(token);
+            const std::string token_text = tokenizer.to_string(token);
+            if (ttft_ms < 0.0 && !token_text.empty()) {
+                ttft_ms = static_cast<double>(total_timer.elapsed_time_ms());
+            }
+            output_text += token_text;
         }
     }
 
@@ -723,10 +751,25 @@ inline ModelOutput blocking_inference(
     output_text += end_of_text ? "[end of text]" : "";
 
     const size_t decode_time_ms = timer.elapsed_time_ms();
+    const size_t total_time_ms  = total_timer.elapsed_time_ms();
+    const size_t decode_steps   = step > 1 ? step - 1 : 0;
+    const double prefill_tps    = prefill_time_ms > 0 ? num_prefill_token * 1000.0 / prefill_time_ms : 0.0;
+    const double decode_tps     = decode_time_ms > 0 ? decode_steps * 1000.0 / decode_time_ms : 0.0;
+
     POWERSERVE_LOG_INFO(
         "decode  step: {}, decode  time: {}ms ({} token/s)", step, decode_time_ms, step * 1000.f / decode_time_ms
     );
     POWERSERVE_LOG_DEBUG("Model output token: {}", output_text);
+    POWERSERVE_LOG_INFO(
+        "request metrics: request_id={}, T_total_ms={}, T_prefill_ms={}, T_decode_ms={}, TTFT_ms={}, decode_tps={}, prefill_tps={}",
+        input.request_id,
+        total_time_ms,
+        prefill_time_ms,
+        decode_time_ms,
+        ttft_ms,
+        decode_tps,
+        prefill_tps
+    );
 
     return {
         .m_text             = output_text,
