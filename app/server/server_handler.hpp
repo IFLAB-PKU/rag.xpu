@@ -31,6 +31,7 @@
 #include "speculative/spec_model.hpp"
 
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -708,7 +709,7 @@ inline BlockingPrefillResult run_blocking_prefill(
     return {
         .iter              = std::move(iter),
         .num_prefill_token = num_prefill_token,
-        .prefill_time_ms   = prefill_timer.elapsed_time_ms()
+        .prefill_time_ms   = static_cast<size_t>(prefill_timer.elapsed_time_ms())
     };
 }
 
@@ -793,22 +794,86 @@ inline ModelOutput run_blocking_decode_from_artifact(
     };
 }
 
+struct PDOrchestratorTask {
+    const ModelContext *context = nullptr;
+    const ModelInput *input     = nullptr;
+    std::string input_prompt;
+    std::unique_ptr<powerserve::SamplerChain> sampler_ptr;
+    std::optional<BlockingPrefillResult> prefill_result;
+};
+
+class PDOrchestrator {
+public:
+    ModelOutput run_single_prompt(const ModelContext &context, const ModelInput &input, const std::string &input_prompt) {
+        PDOrchestratorTask task{
+            .context      = &context,
+            .input        = &input,
+            .input_prompt = input_prompt,
+        };
+        m_prefill_queue.push_back(std::move(task));
+        POWERSERVE_LOG_INFO("pd orchestrator: request {} queued to prefill", input.request_id);
+
+        process_prefill_queue();
+        return process_decode_queue();
+    }
+
+private:
+    std::deque<PDOrchestratorTask> m_prefill_queue;
+    std::deque<PDOrchestratorTask> m_decode_queue;
+
+private:
+    void process_prefill_queue() {
+        POWERSERVE_ASSERT(!m_prefill_queue.empty());
+
+        PDOrchestratorTask task = std::move(m_prefill_queue.front());
+        m_prefill_queue.pop_front();
+
+        POWERSERVE_ASSERT(task.context != nullptr);
+        POWERSERVE_ASSERT(task.input != nullptr);
+
+        const auto &context       = *task.context;
+        const auto &input         = *task.input;
+        const auto &tokenizer     = *context.m_tokenizer_ptr;
+        auto sampler_config       = context.m_config.hyper_params.sampler_config;
+        sampler_config.temperature     = input.m_temperature;
+        sampler_config.penalty_freq    = input.m_frequency_penalty;
+        sampler_config.penalty_present = input.m_presence_penalty;
+        sampler_config.penalty_repeat  = input.m_repeat_penalty;
+        sampler_config.top_p           = input.m_top_p;
+        sampler_config.temperature     = input.m_temperature;
+        task.sampler_ptr = std::make_unique<powerserve::SamplerChain>(sampler_config, tokenizer);
+
+        task.prefill_result = run_blocking_prefill(context, input, task.input_prompt, *task.sampler_ptr);
+        POWERSERVE_LOG_INFO("pd orchestrator: request {} moved to decode", input.request_id);
+        m_decode_queue.push_back(std::move(task));
+    }
+
+    ModelOutput process_decode_queue() {
+        POWERSERVE_ASSERT(!m_decode_queue.empty());
+
+        PDOrchestratorTask task = std::move(m_decode_queue.front());
+        m_decode_queue.pop_front();
+
+        POWERSERVE_ASSERT(task.context != nullptr);
+        POWERSERVE_ASSERT(task.input != nullptr);
+        POWERSERVE_ASSERT(task.sampler_ptr != nullptr);
+        POWERSERVE_ASSERT(task.prefill_result.has_value());
+
+        const auto &context = *task.context;
+        const auto &input   = *task.input;
+        const auto &tokenizer = *context.m_tokenizer_ptr;
+
+        POWERSERVE_LOG_INFO("pd orchestrator: decoding request {}", input.request_id);
+        return run_blocking_decode_from_artifact(input, tokenizer, task.prefill_result.value());
+    }
+};
+
 inline ModelOutput blocking_inference(
     const ModelContext &context, const ModelInput &input, const std::string &input_prompt
 ) {
     using namespace powerserve;
 
     auto &config    = context.m_config;
-    auto &tokenizer = *context.m_tokenizer_ptr;
-
-    auto sampler_config            = config.hyper_params.sampler_config;
-    sampler_config.temperature     = input.m_temperature;
-    sampler_config.penalty_freq    = input.m_frequency_penalty;
-    sampler_config.penalty_present = input.m_presence_penalty;
-    sampler_config.penalty_repeat  = input.m_repeat_penalty;
-    sampler_config.top_p           = input.m_top_p;
-    sampler_config.temperature     = input.m_temperature;
-    powerserve::SamplerChain sampler{sampler_config, tokenizer};
 
     const size_t max_num_token = input.m_max_num_token;
     const size_t batch_size    = config.hyper_params.batch_size;
@@ -817,8 +882,8 @@ inline ModelOutput blocking_inference(
     POWERSERVE_LOG_DEBUG("Model max token : {}", max_num_token);
     POWERSERVE_LOG_DEBUG("Model batch size: {}", batch_size);
 
-    BlockingPrefillResult prefill_result = run_blocking_prefill(context, input, input_prompt, sampler);
-    return run_blocking_decode_from_artifact(input, tokenizer, prefill_result);
+    PDOrchestrator orchestrator;
+    return orchestrator.run_single_prompt(context, input, input_prompt);
 }
 
 inline ModelOutput blocking_embedding(
