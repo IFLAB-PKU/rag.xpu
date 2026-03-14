@@ -34,6 +34,8 @@ public:
 
     std::string m_template_type;
 
+    std::string m_template_rerank;
+
 public:
     explicit Tokenizer(const Path &vocab_path);
     ~Tokenizer() = default;
@@ -45,7 +47,10 @@ public:
     auto tokenize(const std::string &text, bool add_special) const -> std::vector<Token>;
     auto to_string(Token token, bool special = true) const -> std::string;
 
-    auto apply_chat_template(const std::vector<ChatEntry> &chat_history, const bool add_ass) const -> std::string;
+    auto apply_chat_template(const std::vector<ChatEntry> &chat_history, const bool add_ass) const -> std::string; // tokenizer.chat_template
+
+    auto apply_rerank_template(const std::string &query, const std::string &document) const -> std::string; // tokenizer.chat_template.rerank
+
 
 public:
     void debug_tokenizer() {

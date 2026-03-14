@@ -131,6 +131,15 @@ public:
         return {};
     };
 
+    virtual auto compute_rerank_score(const std::vector<Token> &tokens, size_t batch_size) 
+    -> float {
+        (void)tokens; // unused
+        (void)batch_size; // unused
+        POWERSERVE_LOG_ERROR("compute_rerank_score is not implemented for this model.");
+        throw std::runtime_error("Rerank not supported");
+        return 0.0f;
+    };
+
 public:
     virtual auto decode(Sampler &sampler, const std::vector<Token> tokens, const std::vector<int> pos, bool lm_head)
         -> std::vector<Token> = 0;
@@ -160,7 +169,9 @@ public:
             return;
         }
 
-        auto prompt_tokens   = m_tokenizer.tokenize(m_prompt, m_tokenizer.m_vocab.tokenizer_add_bos);
+        bool add_special_tokens = m_tokenizer.m_vocab.tokenizer_add_bos || m_tokenizer.m_vocab.tokenizer_add_eos;
+        auto prompt_tokens   = m_tokenizer.tokenize(m_prompt, add_special_tokens);
+        POWERSERVE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens);
         auto n_prompt_tokens = prompt_tokens.size();
         size_t n_prefilled   = 0;
         size_t position      = 0;

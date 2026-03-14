@@ -21,11 +21,22 @@ class ModelLoader:
                 self.tensor_map[name] = tensors.get_tensor(name)
 
     def contain(self, name: str) -> bool:
-        return name in self.tensor_map
+        if name in self.tensor_map:
+            return True
+        # Check for non-prefix version, e.g. Qwen3-Embedding
+        if name.startswith("model.") and name[6:] in self.tensor_map:
+            return True
+        return False
 
     def load(self, dest: nn.Module | torch.Tensor, name: str, transposed: bool = False):
         """Look up tensor in tensor map and copy data to destination tensor"""
 
+        # [FIX] Smart key lookup: try removing "model." prefix if original key is not found
+        if name not in self.tensor_map and name.startswith("model."):
+            fallback_name = name[6:]
+            if fallback_name in self.tensor_map:
+                name = fallback_name
+                
         tensor = self.tensor_map[name]
 
         target = None
@@ -311,7 +322,7 @@ class LlamaAttention(nn.Module):
         wq = torch.empty(self.embed_dim, self.embed_dim, dtype=torch.float32, device=self.device)
         ### lsh 修改
         if "qwen3" in self.model_name:
-            wq = torch.empty(2*self.embed_dim, self.embed_dim, dtype=torch.float32, device=self.device)
+            wq = torch.empty(self.head_dim * self.n_heads, self.embed_dim, dtype=torch.float32, device=self.device)
         ###
         loader.load(wq, f"model.layers.{self.layer_id}.self_attn.q_proj.weight")
         
@@ -356,7 +367,7 @@ class LlamaAttention(nn.Module):
         wo = torch.empty(self.embed_dim, self.embed_dim, dtype=torch.float32, device=self.device)
         ### lsh 修改
         if "qwen3" in self.model_name:
-            wo = torch.empty(self.embed_dim, 2*self.embed_dim, dtype=torch.float32, device=self.device)
+            wo = torch.empty(self.embed_dim, self.head_dim * self.n_heads, dtype=torch.float32, device=self.device)
         ###
         loader.load(wo, f"model.layers.{self.layer_id}.self_attn.o_proj.weight")
         o_heads = wo.reshape(self.embed_dim, self.n_heads, self.head_dim)
@@ -380,8 +391,6 @@ class LlamaAttention(nn.Module):
        
 
         ### lsh 修改 
-        # 这里怪的很，注释掉就不报错，不注释掉就报
-        # [ ERROR ] QnnModel::addNode() validating node rms_norm_2 failed.[ ERROR ] model.addNode(..., "RmsNorm", ...) ... got MODEL_GRAPH_OP_VALIDATION_ERROR
         if self.q_norm is not None and self.k_norm is not None:
             # Qwen3 逻辑: 投影 -> Norm -> RoPE
             queries = [self.rope(self.q_norm(q_head(attn_input)), rope_embeds) for q_head in self.q_heads]

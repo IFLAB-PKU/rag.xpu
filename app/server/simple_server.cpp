@@ -37,6 +37,9 @@ SimpleServer::SimpleServer(
     const auto embedding_handler = [this](const httplib::Request &request, httplib::Response &response) {
         handler_embedding(m_server_context, request, response);
     };
+    const auto rerank_handler = [this](const httplib::Request &request, httplib::Response &response) {
+        handler_rerank(m_server_context, request, response);
+    };
     const auto model_handler = [this](const httplib::Request &request, httplib::Response &response) {
         handler_model(m_server_context, request, response);
     };
@@ -51,6 +54,10 @@ SimpleServer::SimpleServer(
     m_server->Post("/embedding", embedding_handler);
     m_server->Post("/embeddings", embedding_handler);
     m_server->Post("/v1/embeddings", embedding_handler);
+
+    m_server->Post("/rerank", rerank_handler);
+    m_server->Post("/v1/rerank", rerank_handler);
+    m_server->Post("/v1/reranking", rerank_handler);
 
     m_server->Get("/v1/models", model_handler);
 

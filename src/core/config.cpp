@@ -78,6 +78,8 @@ ModelConfig::ModelConfig(const Path &model_config_file) {
         j["model_id"].get_to(model_id);
         {
             auto &llm_info = j.at("llm_config");
+            llm.is_embedding = llm_info.value("is_embedding", false);
+            llm.is_reranker = llm_info.value("is_reranker", false);
             llm_info["embed_dim"].get_to(llm.dim);
             llm_info["ffn_dim"].get_to(llm.hidden_dim);
             llm_info["n_layers"].get_to(llm.n_layers);

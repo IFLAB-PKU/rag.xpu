@@ -255,6 +255,66 @@ class Qwen3_0_6B_Base_Params(ModelParams):
     n_fp16_neurons = 0
 # Qwen3 已加入
 
+# 新加入Qwen3-Reranker
+class Qwen3_Reranker_0_6B_Params(ModelParams):
+    has_qkv_bias = False
+    use_drelu = False
+    tie_embedding = True
+
+    n_layers = 28
+    vocab_size = 151669
+    ffn_hidden_dim = 3072
+    head_dim = 128
+    n_heads = 16
+    n_kv_heads = 8
+
+    # 显式指明embed_dim
+    embed_dim = 1024
+
+    # RoPE 和 Norm 参数
+    rope_theta = 1e6
+    rms_norm_eps = 1e-6
+    attention_mask_value = -5e4
+
+    # FP16 配置 (保持默认即可)
+    fp16_attention_layers = []
+    fp16_ffn_layers = []
+    fp16_rope = True
+    fp16_qkv_heads = True
+    n_fp16_heads = 0
+    n_fp16_neurons = 0
+# Qwen3-Reranker已加入
+
+# 新加入Qwen3-Embedding
+class Qwen3_Embedding_0_6B_Params(ModelParams):
+    has_qkv_bias = False
+    use_drelu = False
+    tie_embedding = True
+
+    n_layers = 28
+    vocab_size = 151669
+    ffn_hidden_dim = 3072
+    head_dim = 128
+    n_heads = 16
+    n_kv_heads = 8
+
+    # 显式指明embed_dim
+    embed_dim = 1024
+
+    # RoPE 和 Norm 参数
+    rope_theta = 1e6
+    rms_norm_eps = 1e-6
+    attention_mask_value = -5e4
+
+    # FP16 配置 (保持默认即可)
+    fp16_attention_layers = []
+    fp16_ffn_layers = []
+    fp16_rope = True
+    fp16_qkv_heads = True
+    n_fp16_heads = 0
+    n_fp16_neurons = 0
+# Qwen3-Embedding已加入
+
 class SmallThinker_3B_Params(ModelParams):
     has_qkv_bias = True
     use_drelu = False
@@ -362,6 +422,8 @@ model_map: dict[str, ModelParams] = {
     "qwen2.5_0.5b": Qwen2_5_500M_Params,
     "qwen2.5_0.5b_spin": Qwen2_5_500M_Spinquant_Params,
     "qwen3_0.6b_base": Qwen3_0_6B_Base_Params,
+    "qwen3_reranker_0.6b": Qwen3_Reranker_0_6B_Params,
+    "qwen3_embedding_0.6b": Qwen3_Embedding_0_6B_Params,
     "llama3_1_8b": Llama3_1_8B_Params,
     "llama3_2_1b": Llama3_2_1B_Params,
     "llama2_7b": Llama2_7B_Params,

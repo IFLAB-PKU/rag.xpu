@@ -96,6 +96,8 @@ struct ModelConfig {
             int rope_type     = -1;
         } rope_config;
 
+        bool is_embedding   = false;
+        bool is_reranker    = false;
         uint32_t dim        = 0; // n_embd
         uint32_t hidden_dim = 0;
         uint32_t n_layers   = 0;

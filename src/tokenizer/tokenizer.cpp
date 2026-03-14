@@ -39,6 +39,12 @@ Tokenizer::Tokenizer(const Path &vocab_path) {
         );
     }
 
+    const int rerank_template_key_id = gguf_find_key(meta, "tokenizer.chat_template.rerank");
+    if (rerank_template_key_id != -1) {
+        m_template_rerank = gguf_get_val_str(meta, rerank_template_key_id);
+        POWERSERVE_LOG_INFO("found rerank template");
+    }
+
     llm_load_vocab(m_vocab, meta);
 
     gguf_free(meta);
@@ -344,6 +350,32 @@ auto Tokenizer::apply_chat_template(const std::vector<ChatEntry> &chat_history, 
     -> std::string {
     // format the chat to string
     return apply_chat_template_internal(m_template_type, chat_history, add_ass);
+}
+
+static void string_replace_all(std::string &str, const std::string &from, const std::string &to) {
+    if (from.empty()) return;
+    size_t start_pos = 0;
+    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length();
+    }
+}
+
+auto Tokenizer::apply_rerank_template(const std::string &query, const std::string &document) const -> std::string {
+    // Use `tokenizer.chat_template.rerank`
+    if (!m_template_rerank.empty()) {
+        std::string prompt = m_template_rerank;
+        string_replace_all(prompt, "{query}", query);
+        string_replace_all(prompt, "{document}", document);
+        return prompt;
+    }
+
+    // Fallback: Build prompt based on chat_template
+    if (m_template_type == "chatml" || m_template_type.find("<|im_start|>") != std::string::npos) {
+        return fmt::format("<|im_start|>user\n{}\n{}\n<|im_end|>\n<|im_start|>assistant\n", query, document);
+   } 
+   
+   return fmt::format("{} {}", query, document);
 }
 
 } // namespace powerserve
