@@ -31,9 +31,12 @@
 #include "speculative/spec_model.hpp"
 
 #include <cstddef>
+#include <condition_variable>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -279,17 +282,28 @@ public:
     ~ServerContext() = default;
 
 public:
+    ModelContext &setup_model_for_blocking_pd(const ModelInput &input) {
+        constexpr size_t PD_SLOT_COUNT = 2;
+        const std::string slot_model_name =
+            input.m_model + std::string(PD_SLOT_TAG) + std::to_string(input.request_id % PD_SLOT_COUNT);
+        return setup_model(slot_model_name);
+    }
+
     ModelContext &setup_model(const std::string &model_name) {
+        const std::string resolved_model_name = strip_pd_slot_suffix(model_name);
+
         // Parse model name
         std::string_view main_model_name;
         std::string_view draft_model_name;
         {
-            const auto iter = model_name.find('+');
+            const auto iter = resolved_model_name.find('+');
             if (iter == std::string::npos) {
-                main_model_name = std::string_view(model_name);
+                main_model_name = std::string_view(resolved_model_name);
             } else {
-                main_model_name  = std::string_view(model_name.cbegin(), model_name.cbegin() + iter);
-                draft_model_name = std::string_view(model_name.cbegin() + iter + 1, model_name.cend());
+                main_model_name =
+                    std::string_view(resolved_model_name.cbegin(), resolved_model_name.cbegin() + iter);
+                draft_model_name =
+                    std::string_view(resolved_model_name.cbegin() + iter + 1, resolved_model_name.cend());
             }
         }
         POWERSERVE_LOG_INFO("main model: {}, draft model: {}", main_model_name, draft_model_name);
@@ -302,7 +316,10 @@ public:
         }
 
 #ifndef POWERSERVE_SERVER_MULTIMODEL
+    // Keep slot contexts alive for in-process PD overlap experiments.
+    if (!is_pd_slot_model_name(model_name)) {
         destroy_all_models_unsafe();
+    }
 #endif // POWERSERVE_SERVER_MULTIMODEL
 
         const powerserve::Path main_model_path  = model_name_to_path(main_model_name);
@@ -316,13 +333,14 @@ public:
         std::unique_ptr<powerserve::Tokenizer> tokenizer_ptr = std::make_unique<powerserve::Tokenizer>(tokenizer_path);
         POWERSERVE_LOG_INFO("after tokenizer init: {}", powerserve::perf_get_mem_result());
 
-        std::shared_ptr<powerserve::Model> main_model = init_model(main_model_path, workspace_config.hyper_params);
+        std::shared_ptr<powerserve::Model> main_model =
+            init_model(main_model_path, workspace_config.hyper_params, model_name + "#main");
         if (draft_model_path.empty()) {
             m_context_slot_map[model_name] =
                 ModelContext(workspace_config, std::move(main_model), std::move(tokenizer_ptr));
         } else {
             std::shared_ptr<powerserve::Model> draft_model =
-                init_model(draft_model_path, workspace_config.hyper_params);
+                init_model(draft_model_path, workspace_config.hyper_params, model_name + "#draft");
 #if defined(POWERSERVE_WITH_QNN)
             // Speculative decoding still relies on QNN KV interface operations (copy/move/mask).
             auto *main_qnn_kv  = m_platform_ptr->qnn_backend->get_kv_interface(main_model->m_config->model_id);
@@ -422,6 +440,20 @@ public:
     }
 
 private:
+    static constexpr const char *PD_SLOT_TAG = "@pdslot";
+
+    static bool is_pd_slot_model_name(const std::string &model_name) {
+        return model_name.find(PD_SLOT_TAG) != std::string::npos;
+    }
+
+    static std::string strip_pd_slot_suffix(const std::string &model_name) {
+        const auto pos = model_name.find(PD_SLOT_TAG);
+        if (pos == std::string::npos) {
+            return model_name;
+        }
+        return model_name.substr(0, pos);
+    }
+
     powerserve::Path model_name_to_path(const std::string_view model_name) const {
         const powerserve::Path inner_model_folder = m_work_folder / model_name;
         powerserve::Path model_folder;
@@ -438,13 +470,26 @@ private:
     }
 
     std::shared_ptr<powerserve::Model> init_model(
-        const powerserve::Path &model_path, const powerserve::HyperParams &hyper_params
+        const powerserve::Path &model_path,
+        const powerserve::HyperParams &hyper_params,
+        const std::string &instance_key
     ) {
-        if (m_model_map.contains(model_path)) {
-            return m_model_map.at(model_path);
+        if (m_model_map.contains(instance_key)) {
+            return m_model_map.at(instance_key);
         }
 
         std::shared_ptr<powerserve::Model> model_ptr = powerserve::load_model(model_path);
+
+        const auto slot_pos = instance_key.find(PD_SLOT_TAG);
+        if (slot_pos != std::string::npos) {
+            const auto slot_suffix = instance_key.substr(slot_pos);
+            // Keep original ModelConfig object alive because model modules
+            // store references to m_config->llm fields.
+            model_ptr->m_config->model_id = model_ptr->m_config->model_id + slot_suffix;
+            if (!model_ptr->m_config->vision.model_id.empty()) {
+                model_ptr->m_config->vision.model_id = model_ptr->m_config->model_id;
+            }
+        }
 
         model_ptr->m_platform = m_platform_ptr;
         m_platform_ptr->init_ggml_backend(model_ptr->m_config, hyper_params);
@@ -460,7 +505,7 @@ private:
         );
 #endif // POWERSERVE_WITH_QNN
 
-        m_model_map[model_path] = model_ptr;
+        m_model_map[instance_key] = model_ptr;
         return model_ptr;
     }
 
@@ -729,6 +774,7 @@ inline ModelOutput run_blocking_decode_from_artifact(
     while (!prefill_result.iter->end()) {
         auto token = prefill_result.iter->next();
         step++;
+
         if (step == 1) {
             const double prefill_tps_log = prefill_result.prefill_time_ms > 0
                 ? prefill_result.num_prefill_token * 1000.0 / prefill_result.prefill_time_ms
@@ -800,71 +846,156 @@ struct PDOrchestratorTask {
     std::string input_prompt;
     std::unique_ptr<powerserve::SamplerChain> sampler_ptr;
     std::optional<BlockingPrefillResult> prefill_result;
+    std::shared_ptr<std::mutex> model_exec_mutex;
+    std::unique_lock<std::mutex> model_exec_lock;
+    std::promise<ModelOutput> result_promise;
 };
 
 class PDOrchestrator {
 public:
+    PDOrchestrator() {
+        m_prefill_worker = std::thread([this]() { prefill_worker_loop(); });
+        m_decode_worker  = std::thread([this]() { decode_worker_loop(); });
+    }
+
+    ~PDOrchestrator() {
+        {
+            std::lock_guard<std::mutex> lock_guard(m_lock);
+            m_shutdown = true;
+        }
+        m_prefill_cv.notify_all();
+        m_decode_cv.notify_all();
+
+        if (m_prefill_worker.joinable()) {
+            m_prefill_worker.join();
+        }
+        if (m_decode_worker.joinable()) {
+            m_decode_worker.join();
+        }
+    }
+
     ModelOutput run_single_prompt(const ModelContext &context, const ModelInput &input, const std::string &input_prompt) {
         PDOrchestratorTask task{
             .context      = &context,
             .input        = &input,
             .input_prompt = input_prompt,
         };
-        m_prefill_queue.push_back(std::move(task));
-        POWERSERVE_LOG_INFO("pd orchestrator: request {} queued to prefill", input.request_id);
+        std::future<ModelOutput> result_future = task.result_promise.get_future();
 
-        process_prefill_queue();
-        return process_decode_queue();
+        {
+            std::lock_guard<std::mutex> lock_guard(m_lock);
+            m_prefill_queue.push_back(std::move(task));
+        }
+        POWERSERVE_LOG_INFO("pd orchestrator: request {} queued to prefill", input.request_id);
+        m_prefill_cv.notify_one();
+
+        return result_future.get();
     }
 
 private:
     std::deque<PDOrchestratorTask> m_prefill_queue;
     std::deque<PDOrchestratorTask> m_decode_queue;
+    std::unordered_map<std::string, std::shared_ptr<std::mutex>> m_model_exec_lock_map;
+    std::mutex m_lock;
+    std::condition_variable m_prefill_cv;
+    std::condition_variable m_decode_cv;
+    std::thread m_prefill_worker;
+    std::thread m_decode_worker;
+    bool m_shutdown = false;
 
 private:
-    void process_prefill_queue() {
-        POWERSERVE_ASSERT(!m_prefill_queue.empty());
+    std::shared_ptr<std::mutex> get_model_exec_mutex(const std::string &model_id) {
+        std::lock_guard<std::mutex> lock_guard(m_lock);
+        auto iter = m_model_exec_lock_map.find(model_id);
+        if (iter != m_model_exec_lock_map.end()) {
+            return iter->second;
+        }
 
-        PDOrchestratorTask task = std::move(m_prefill_queue.front());
-        m_prefill_queue.pop_front();
-
-        POWERSERVE_ASSERT(task.context != nullptr);
-        POWERSERVE_ASSERT(task.input != nullptr);
-
-        const auto &context       = *task.context;
-        const auto &input         = *task.input;
-        const auto &tokenizer     = *context.m_tokenizer_ptr;
-        auto sampler_config       = context.m_config.hyper_params.sampler_config;
-        sampler_config.temperature     = input.m_temperature;
-        sampler_config.penalty_freq    = input.m_frequency_penalty;
-        sampler_config.penalty_present = input.m_presence_penalty;
-        sampler_config.penalty_repeat  = input.m_repeat_penalty;
-        sampler_config.top_p           = input.m_top_p;
-        sampler_config.temperature     = input.m_temperature;
-        task.sampler_ptr = std::make_unique<powerserve::SamplerChain>(sampler_config, tokenizer);
-
-        task.prefill_result = run_blocking_prefill(context, input, task.input_prompt, *task.sampler_ptr);
-        POWERSERVE_LOG_INFO("pd orchestrator: request {} moved to decode", input.request_id);
-        m_decode_queue.push_back(std::move(task));
+        auto mutex_ptr = std::make_shared<std::mutex>();
+        m_model_exec_lock_map.emplace(model_id, mutex_ptr);
+        return mutex_ptr;
     }
 
-    ModelOutput process_decode_queue() {
-        POWERSERVE_ASSERT(!m_decode_queue.empty());
+    void prefill_worker_loop() {
+        while (true) {
+            PDOrchestratorTask task;
+            {
+                std::unique_lock<std::mutex> lock(m_lock);
+                m_prefill_cv.wait(lock, [this]() { return m_shutdown || !m_prefill_queue.empty(); });
+                if (m_shutdown && m_prefill_queue.empty()) {
+                    return;
+                }
+                task = std::move(m_prefill_queue.front());
+                m_prefill_queue.pop_front();
+            }
 
-        PDOrchestratorTask task = std::move(m_decode_queue.front());
-        m_decode_queue.pop_front();
+            try {
+                POWERSERVE_ASSERT(task.context != nullptr);
+                POWERSERVE_ASSERT(task.input != nullptr);
 
-        POWERSERVE_ASSERT(task.context != nullptr);
-        POWERSERVE_ASSERT(task.input != nullptr);
-        POWERSERVE_ASSERT(task.sampler_ptr != nullptr);
-        POWERSERVE_ASSERT(task.prefill_result.has_value());
+                const auto &context   = *task.context;
+                const auto &input     = *task.input;
+                const auto &tokenizer = *context.m_tokenizer_ptr;
 
-        const auto &context = *task.context;
-        const auto &input   = *task.input;
-        const auto &tokenizer = *context.m_tokenizer_ptr;
+                auto sampler_config       = context.m_config.hyper_params.sampler_config;
+                sampler_config.temperature     = input.m_temperature;
+                sampler_config.penalty_freq    = input.m_frequency_penalty;
+                sampler_config.penalty_present = input.m_presence_penalty;
+                sampler_config.penalty_repeat  = input.m_repeat_penalty;
+                sampler_config.top_p           = input.m_top_p;
+                sampler_config.temperature     = input.m_temperature;
+                task.sampler_ptr = std::make_unique<powerserve::SamplerChain>(sampler_config, tokenizer);
 
-        POWERSERVE_LOG_INFO("pd orchestrator: decoding request {}", input.request_id);
-        return run_blocking_decode_from_artifact(input, tokenizer, task.prefill_result.value());
+                task.model_exec_mutex = get_model_exec_mutex(context.m_model_ptr->m_config->model_id);
+                POWERSERVE_ASSERT(task.model_exec_mutex != nullptr);
+                task.model_exec_lock = std::unique_lock<std::mutex>(*task.model_exec_mutex);
+
+                POWERSERVE_LOG_INFO("pd orchestrator: prefill request {} start", input.request_id);
+                task.prefill_result = run_blocking_prefill(context, input, task.input_prompt, *task.sampler_ptr);
+
+                {
+                    std::lock_guard<std::mutex> lock_guard(m_lock);
+                    m_decode_queue.push_back(std::move(task));
+                }
+                POWERSERVE_LOG_INFO("pd orchestrator: request {} moved to decode", input.request_id);
+                m_decode_cv.notify_one();
+            } catch (...) {
+                task.result_promise.set_exception(std::current_exception());
+            }
+        }
+    }
+
+    void decode_worker_loop() {
+        while (true) {
+            PDOrchestratorTask task;
+            {
+                std::unique_lock<std::mutex> lock(m_lock);
+                m_decode_cv.wait(lock, [this]() { return m_shutdown || !m_decode_queue.empty(); });
+                if (m_shutdown && m_decode_queue.empty()) {
+                    return;
+                }
+                task = std::move(m_decode_queue.front());
+                m_decode_queue.pop_front();
+            }
+
+            try {
+                POWERSERVE_ASSERT(task.context != nullptr);
+                POWERSERVE_ASSERT(task.input != nullptr);
+                POWERSERVE_ASSERT(task.sampler_ptr != nullptr);
+                POWERSERVE_ASSERT(task.prefill_result.has_value());
+
+                const auto &context   = *task.context;
+                const auto &input     = *task.input;
+                const auto &tokenizer = *context.m_tokenizer_ptr;
+
+                POWERSERVE_LOG_INFO("pd orchestrator: decode request {} start", input.request_id);
+                ModelOutput output =
+                    run_blocking_decode_from_artifact(input, tokenizer, task.prefill_result.value());
+                task.result_promise.set_value(std::move(output));
+            } catch (...) {
+                task.result_promise.set_exception(std::current_exception());
+            }
+        }
     }
 };
 
@@ -882,7 +1013,7 @@ inline ModelOutput blocking_inference(
     POWERSERVE_LOG_DEBUG("Model max token : {}", max_num_token);
     POWERSERVE_LOG_DEBUG("Model batch size: {}", batch_size);
 
-    PDOrchestrator orchestrator;
+    static PDOrchestrator orchestrator;
     return orchestrator.run_single_prompt(context, input, input_prompt);
 }
 
@@ -999,7 +1130,7 @@ inline ModelOutput blocking_rerank(
 inline ModelOutput completion(ServerContext &server_context, const ModelInput &input) {
     using namespace powerserve;
     /* Parse and concat user inputs */
-    const ModelContext &context = server_context.setup_model(input.m_model);
+    const ModelContext &context = server_context.setup_model_for_blocking_pd(input);
     const Tokenizer &tokenizer  = *context.m_tokenizer_ptr;
 
     return blocking_inference(context, input, input.m_prompt);
@@ -1018,7 +1149,7 @@ inline void completion(ServerContext &server_context, ServerSession &session) {
 inline ModelOutput chat(ServerContext &server_context, const ModelInput &input) {
     using namespace powerserve;
     /* Parse and concat user inputs */
-    const ModelContext &context    = server_context.setup_model(input.m_model);
+    const ModelContext &context    = server_context.setup_model_for_blocking_pd(input);
     const Tokenizer &tokenizer     = *context.m_tokenizer_ptr;
     const std::string input_prompt = tokenizer.apply_chat_template(input.m_history, true);
 
