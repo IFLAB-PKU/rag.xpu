@@ -703,14 +703,16 @@ inline void stream_inference(const ModelContext &context, ServerSession &session
         "decode  step: {}, decode  time: {}ms ({} token/s)", step, decode_time_ms, step * 1000.f / decode_time_ms
     );
     POWERSERVE_LOG_INFO(
-        "request metrics: request_id={}, T_total_ms={}, T_prefill_ms={}, T_decode_ms={}, TTFT_ms={}, decode_tps={}, prefill_tps={}",
+        "PD_METRIC request_id={},prefill_tokens={},decode_tokens={},T_total_ms={},T_prefill_ms={},T_decode_ms={},TTFT_ms={},prefill_tps={},decode_tps={}",
         input.request_id,
+        num_prefill_token,
+        decode_steps,
         total_time_ms,
         prefill_time_ms,
         decode_time_ms,
         ttft_ms,
-        decode_tps,
-        prefill_tps
+        prefill_tps,
+        decode_tps
     );
 }
 
@@ -820,16 +822,17 @@ inline ModelOutput run_blocking_decode_from_artifact(
     POWERSERVE_LOG_INFO(
         "decode  step: {}, decode  time: {}ms ({} token/s)", step, decode_time_ms, step * 1000.f / decode_time_ms
     );
-    POWERSERVE_LOG_DEBUG("Model output token: {}", output_text);
     POWERSERVE_LOG_INFO(
-        "request metrics: request_id={}, T_total_ms={}, T_prefill_ms={}, T_decode_ms={}, TTFT_ms={}, decode_tps={}, prefill_tps={}",
+        "PD_METRIC request_id={},prefill_tokens={},decode_tokens={},T_total_ms={},T_prefill_ms={},T_decode_ms={},TTFT_ms={},prefill_tps={},decode_tps={}",
         input.request_id,
+        prefill_result.num_prefill_token,
+        decode_steps,
         total_time_ms,
         prefill_result.prefill_time_ms,
         decode_time_ms,
         ttft_ms,
-        decode_tps,
-        prefill_tps
+        prefill_tps,
+        decode_tps
     );
 
     return {

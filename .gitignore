@@ -14,3 +14,17 @@ Pipfile
 tools/llama_tf_to_qnn_bin
 tools/process_image
 *.log
+
+libs/llama_tokenizer_*/
+compare*.py
+
+*.npy
+*.txt
+*.csv
+
+docs/pd_split_baseline_contract.md
+old-compare-log/
+docs/timeout-reason.md
+tests/pd-bench-*.csv
+tests/server-metrics*.md
+tests/server-overlap.log

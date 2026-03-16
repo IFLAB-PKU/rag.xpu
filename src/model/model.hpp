@@ -171,7 +171,7 @@ public:
 
         bool add_special_tokens = m_tokenizer.m_vocab.tokenizer_add_bos || m_tokenizer.m_vocab.tokenizer_add_eos;
         auto prompt_tokens   = m_tokenizer.tokenize(m_prompt, add_special_tokens);
-        POWERSERVE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens);
+        // POWERSERVE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens);
         auto n_prompt_tokens = prompt_tokens.size();
         size_t n_prefilled   = 0;
         size_t position      = 0;
