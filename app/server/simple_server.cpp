@@ -16,6 +16,7 @@
 
 #include "httplib.h"
 #include "openai_api.hpp"
+#include "rag_api.hpp"
 
 #include <memory>
 #include <string>
@@ -43,6 +44,9 @@ SimpleServer::SimpleServer(
     const auto model_handler = [this](const httplib::Request &request, httplib::Response &response) {
         handler_model(m_server_context, request, response);
     };
+    const auto rag_handler = [this](const httplib::Request &request, httplib::Response &response) {
+        handler_rag(m_server_context, request, response);
+    };
 
     m_server->Post("/completion", completion_handler);
     m_server->Post("/completions", completion_handler);
@@ -58,6 +62,9 @@ SimpleServer::SimpleServer(
     m_server->Post("/rerank", rerank_handler);
     m_server->Post("/v1/rerank", rerank_handler);
     m_server->Post("/v1/reranking", rerank_handler);
+
+    m_server->Post("/rag", rag_handler);
+    m_server->Post("/v1/rag", rag_handler);
 
     m_server->Get("/v1/models", model_handler);
 

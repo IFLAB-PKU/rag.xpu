@@ -1,0 +1,307 @@
+// Copyright 2024-2025 PowerServe Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include "server_handler.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstddef>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+struct RagRequest {
+    std::string doc;
+    std::string query;
+
+    std::string mode = "sequential";
+    bool enable_query_expansion = false;
+
+    std::string generation_model;
+    std::string embedding_model;
+    std::string rerank_model;
+    std::string expansion_model;
+
+    size_t top_k = 20;
+    size_t top_n = 5;
+    size_t max_tokens = 128;
+    float temperature = 0.2F;
+};
+
+struct RagStageMetrics {
+    size_t indexing_ms = 0;
+    size_t query_expand_ms = 0;
+    size_t embedding_ms = 0;
+    size_t searching_ms = 0;
+    size_t reranking_ms = 0;
+    size_t generation_ms = 0;
+    size_t total_ms = 0;
+};
+
+struct RagResponse {
+    std::string answer;
+    std::string mode_requested;
+    std::string mode_used;
+    std::string query_used;
+    std::vector<std::string> context_chunks;
+    std::vector<size_t> top_k_indices;
+    std::vector<size_t> top_n_indices;
+    RagStageMetrics metrics;
+};
+
+inline size_t next_rag_request_id() {
+    static std::atomic_size_t request_counter{0};
+    return request_counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline std::string rag_trim(std::string s) {
+    const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+
+    while (!s.empty() && is_space(static_cast<unsigned char>(s.front()))) {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && is_space(static_cast<unsigned char>(s.back()))) {
+        s.pop_back();
+    }
+    return s;
+}
+
+inline std::vector<std::string> rag_split_document(const std::string &doc) {
+    std::vector<std::string> chunks;
+    std::string current;
+    current.reserve(doc.size());
+
+    for (const char ch : doc) {
+        current.push_back(ch);
+        if (ch == '.' || ch == '!' || ch == '?' || ch == '\n') {
+            std::string trimmed = rag_trim(current);
+            if (!trimmed.empty()) {
+                chunks.push_back(std::move(trimmed));
+            }
+            current.clear();
+        }
+    }
+
+    std::string tail = rag_trim(current);
+    if (!tail.empty()) {
+        chunks.push_back(std::move(tail));
+    }
+
+    return chunks;
+}
+
+inline float rag_cosine_similarity(const std::vector<float> &a, const std::vector<float> &b) {
+    if (a.empty() || b.empty() || a.size() != b.size()) {
+        return -1.0F;
+    }
+
+    double dot = 0.0;
+    double norm_a = 0.0;
+    double norm_b = 0.0;
+
+    for (size_t i = 0; i < a.size(); ++i) {
+        const double va = static_cast<double>(a[i]);
+        const double vb = static_cast<double>(b[i]);
+        dot += va * vb;
+        norm_a += va * va;
+        norm_b += vb * vb;
+    }
+
+    if (norm_a <= 0.0 || norm_b <= 0.0) {
+        return -1.0F;
+    }
+
+    return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
+}
+
+inline ModelInput make_generation_input(const RagRequest &request, const std::string &prompt) {
+    return ModelInput{
+        .m_model = request.generation_model,
+        .m_prompt = prompt,
+        .m_max_num_token = request.max_tokens,
+        .m_temperature = request.temperature,
+        .m_top_p = 1.0F,
+        .m_presence_penalty = 0.0F,
+        .m_frequency_penalty = 0.0F,
+        .m_response_n = 1,
+        .m_best_of_n = 1,
+        .m_log_probs = 0,
+        .stream = false,
+        .m_repeat_penalty = 1.0F,
+        .request_id = next_rag_request_id()
+    };
+}
+
+inline ModelInput make_embedding_input(const std::string &model, const std::string &text) {
+    return ModelInput{
+        .m_model = model,
+        .m_prompt = text,
+        .request_id = next_rag_request_id()
+    };
+}
+
+inline ModelInput make_rerank_input(
+    const RagRequest &request,
+    const std::string &query,
+    const std::vector<std::string> &documents
+) {
+    return ModelInput{
+        .m_model = request.rerank_model,
+        .m_prompt = query,
+        .m_documents = documents,
+        .m_top_n = request.top_n,
+        .request_id = next_rag_request_id()
+    };
+}
+
+inline std::string build_generation_prompt(const std::string &query, const std::vector<std::string> &context_chunks) {
+    std::ostringstream oss;
+    oss << "You are a concise and faithful QA assistant. Use only the provided context.\n";
+    oss << "Context:\n";
+    for (const auto &chunk : context_chunks) {
+        oss << "- " << chunk << "\n";
+    }
+    oss << "Question: " << query << "\n";
+    oss << "Answer:";
+    return oss.str();
+}
+
+inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRequest &request) {
+    using namespace powerserve;
+
+    if (request.doc.empty()) {
+        throw std::invalid_argument("'doc' must not be empty");
+    }
+    if (request.query.empty()) {
+        throw std::invalid_argument("'query' must not be empty");
+    }
+    if (request.generation_model.empty() || request.embedding_model.empty() || request.rerank_model.empty()) {
+        throw std::invalid_argument("'generation_model', 'embedding_model', and 'rerank_model' are required");
+    }
+
+    RagResponse response;
+    response.mode_requested = request.mode;
+    response.mode_used = request.mode == "hetero_parallel" ? "sequential" : request.mode;
+    response.query_used = request.query;
+
+    Timer total_timer;
+
+    // 1) Indexing
+    Timer stage_timer;
+    const std::vector<std::string> chunks = rag_split_document(request.doc);
+    response.metrics.indexing_ms = stage_timer.elapsed_time_ms();
+    if (chunks.empty()) {
+        throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
+    }
+
+    // 2) Query expansion (optional)
+    std::string expanded_query = request.query;
+    if (request.enable_query_expansion) {
+        stage_timer = Timer{};
+        const std::string model_for_expand = request.expansion_model.empty() ? request.generation_model : request.expansion_model;
+        ModelInput expand_input = make_generation_input(request, "Question: " + request.query + "\n\nOutput:");
+        expand_input.m_model = model_for_expand;
+        const ModelOutput expand_output = completion(server_context, expand_input);
+        if (!expand_output.m_text.empty()) {
+            expanded_query = expand_output.m_text;
+            response.query_used = expanded_query;
+        }
+        response.metrics.query_expand_ms = stage_timer.elapsed_time_ms();
+    }
+
+    // 3) Embedding
+    stage_timer = Timer{};
+    const ModelOutput query_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, expanded_query));
+    if (query_embedding_out.m_embedding.empty()) {
+        throw std::runtime_error("query embedding is empty");
+    }
+
+    std::vector<std::vector<float>> doc_embeddings;
+    std::vector<size_t> doc_embedding_source_indices;
+    doc_embeddings.reserve(chunks.size());
+    doc_embedding_source_indices.reserve(chunks.size());
+    for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+        const auto &chunk = chunks[chunk_idx];
+        const ModelOutput doc_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, chunk));
+        if (doc_embedding_out.m_embedding.empty()) {
+            continue;
+        }
+        doc_embeddings.push_back(doc_embedding_out.m_embedding);
+        doc_embedding_source_indices.push_back(chunk_idx);
+    }
+    response.metrics.embedding_ms = stage_timer.elapsed_time_ms();
+    if (doc_embeddings.empty()) {
+        throw std::runtime_error("all document embeddings are empty");
+    }
+
+    // 4) Searching
+    stage_timer = Timer{};
+    std::vector<std::pair<size_t, float>> scored;
+    scored.reserve(doc_embeddings.size());
+    for (size_t i = 0; i < doc_embeddings.size(); ++i) {
+        const float score = rag_cosine_similarity(query_embedding_out.m_embedding, doc_embeddings[i]);
+        scored.push_back({doc_embedding_source_indices[i], score});
+    }
+    std::sort(scored.begin(), scored.end(), [](const auto &lhs, const auto &rhs) { return lhs.second > rhs.second; });
+
+    const size_t actual_top_k = std::min(request.top_k, scored.size());
+    std::vector<std::string> top_k_docs;
+    top_k_docs.reserve(actual_top_k);
+    for (size_t i = 0; i < actual_top_k; ++i) {
+        response.top_k_indices.push_back(scored[i].first);
+        top_k_docs.push_back(chunks[scored[i].first]);
+    }
+    response.metrics.searching_ms = stage_timer.elapsed_time_ms();
+    if (top_k_docs.empty()) {
+        throw std::runtime_error("retrieval returns empty top_k docs");
+    }
+
+    // 5) Reranking
+    stage_timer = Timer{};
+    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, expanded_query, top_k_docs));
+
+    std::vector<std::string> selected_context;
+    for (const auto &item : rerank_out.m_rerank_results) {
+        if (item.index >= top_k_docs.size()) {
+            continue;
+        }
+        response.top_n_indices.push_back(response.top_k_indices[item.index]);
+        selected_context.push_back(top_k_docs[item.index]);
+    }
+
+    if (selected_context.empty()) {
+        const size_t fallback_n = std::min(request.top_n, top_k_docs.size());
+        for (size_t i = 0; i < fallback_n; ++i) {
+            response.top_n_indices.push_back(response.top_k_indices[i]);
+            selected_context.push_back(top_k_docs[i]);
+        }
+    }
+    response.metrics.reranking_ms = stage_timer.elapsed_time_ms();
+
+    // 6) Generation
+    stage_timer = Timer{};
+    const std::string generation_prompt = build_generation_prompt(expanded_query, selected_context);
+    const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+    response.answer = generation_out.m_text;
+    response.context_chunks = std::move(selected_context);
+    response.metrics.generation_ms = stage_timer.elapsed_time_ms();
+
+    response.metrics.total_ms = total_timer.elapsed_time_ms();
+    return response;
+}
