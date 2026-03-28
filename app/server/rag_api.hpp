@@ -54,6 +54,17 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
 }
 
 inline nlohmann::json dump_rag_response(const RagResponse &response) {
+    const nlohmann::json stage_timeline = nlohmann::json::array({
+        nlohmann::json{{"stage", "indexing"}, {"ms", response.metrics.indexing_ms}},
+        nlohmann::json{{"stage", "doc_embedding"}, {"ms", response.metrics.doc_embedding_ms}},
+        nlohmann::json{{"stage", "query_expand"}, {"ms", response.metrics.query_expand_ms}},
+        nlohmann::json{{"stage", "query_embedding"}, {"ms", response.metrics.query_embedding_ms}},
+        nlohmann::json{{"stage", "searching"}, {"ms", response.metrics.searching_ms}},
+        nlohmann::json{{"stage", "reranking"}, {"ms", response.metrics.reranking_ms}},
+        nlohmann::json{{"stage", "generation"}, {"ms", response.metrics.generation_ms}},
+        nlohmann::json{{"stage", "total"}, {"ms", response.metrics.total_ms}}
+    });
+
     return {
         {"object", "rag.result"},
         {"mode_requested", response.mode_requested},
@@ -67,11 +78,14 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
         {"stage_metrics_ms",
          {{"indexing", response.metrics.indexing_ms},
           {"query_expand", response.metrics.query_expand_ms},
+                    {"doc_embedding", response.metrics.doc_embedding_ms},
+                    {"query_embedding", response.metrics.query_embedding_ms},
           {"embedding", response.metrics.embedding_ms},
           {"searching", response.metrics.searching_ms},
           {"reranking", response.metrics.reranking_ms},
           {"generation", response.metrics.generation_ms},
-          {"total", response.metrics.total_ms}}}
+                    {"total", response.metrics.total_ms}}},
+                {"stage_timeline", stage_timeline}
     };
 }
 
