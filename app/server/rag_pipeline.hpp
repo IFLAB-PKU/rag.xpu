@@ -16,6 +16,8 @@
 
 #include "server_handler.hpp"
 
+#include <faiss/IndexFlat.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -142,28 +144,61 @@ inline std::vector<std::string> rag_split_document(const std::string &doc) {
     return chunks;
 }
 
-inline float rag_cosine_similarity(const std::vector<float> &a, const std::vector<float> &b) {
-    if (a.empty() || b.empty() || a.size() != b.size()) {
-        return -1.0F;
+inline std::vector<size_t> rag_search_faiss_ip(
+    const std::vector<std::vector<float>> &doc_embeddings,
+    const std::vector<size_t> &doc_embedding_source_indices,
+    const std::vector<float> &query_embedding,
+    size_t top_k
+) {
+    if (doc_embeddings.empty()) {
+        throw std::runtime_error("document embeddings are empty");
+    }
+    if (query_embedding.empty()) {
+        throw std::runtime_error("query embedding is empty");
+    }
+    if (doc_embeddings.size() != doc_embedding_source_indices.size()) {
+        throw std::runtime_error("doc embedding index mapping size mismatch");
     }
 
-    double dot = 0.0;
-    double norm_a = 0.0;
-    double norm_b = 0.0;
-
-    for (size_t i = 0; i < a.size(); ++i) {
-        const double va = static_cast<double>(a[i]);
-        const double vb = static_cast<double>(b[i]);
-        dot += va * vb;
-        norm_a += va * va;
-        norm_b += vb * vb;
+    const size_t dim = query_embedding.size();
+    for (const auto &emb : doc_embeddings) {
+        if (emb.size() != dim) {
+            throw std::runtime_error("embedding dimension mismatch");
+        }
     }
 
-    if (norm_a <= 0.0 || norm_b <= 0.0) {
-        return -1.0F;
+    const size_t k = std::min(top_k, doc_embeddings.size());
+    if (k == 0) {
+        return {};
     }
 
-    return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
+    std::vector<float> database;
+    database.reserve(doc_embeddings.size() * dim);
+    for (const auto &emb : doc_embeddings) {
+        database.insert(database.end(), emb.begin(), emb.end());
+    }
+
+    faiss::IndexFlatIP index(static_cast<faiss::Index::idx_t>(dim));
+    index.add(static_cast<faiss::Index::idx_t>(doc_embeddings.size()), database.data());
+
+    std::vector<float> distances(k);
+    std::vector<faiss::Index::idx_t> labels(k);
+    index.search(1, query_embedding.data(), static_cast<faiss::Index::idx_t>(k), distances.data(), labels.data());
+
+    std::vector<size_t> top_indices;
+    top_indices.reserve(k);
+    for (size_t i = 0; i < k; ++i) {
+        const faiss::Index::idx_t label = labels[i];
+        if (label < 0) {
+            continue;
+        }
+        const size_t dense_idx = static_cast<size_t>(label);
+        if (dense_idx >= doc_embedding_source_indices.size()) {
+            continue;
+        }
+        top_indices.push_back(doc_embedding_source_indices[dense_idx]);
+    }
+    return top_indices;
 }
 
 inline ModelInput make_generation_input(const RagRequest &request, const std::string &prompt) {
@@ -301,22 +336,21 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     response.metrics.query_embedding_ms = stage_timer.elapsed_time_ms();
     response.metrics.embedding_ms += response.metrics.query_embedding_ms;
 
-    // 5) Searching
+    // 5) Searching (FAISS IndexFlatIP)
     stage_timer = Timer{};
-    std::vector<std::pair<size_t, float>> scored;
-    scored.reserve(doc_embeddings.size());
-    for (size_t i = 0; i < doc_embeddings.size(); ++i) {
-        const float score = rag_cosine_similarity(query_embedding_out.m_embedding, doc_embeddings[i]);
-        scored.push_back({doc_embedding_source_indices[i], score});
-    }
-    std::sort(scored.begin(), scored.end(), [](const auto &lhs, const auto &rhs) { return lhs.second > rhs.second; });
+    const std::vector<size_t> faiss_top_indices = rag_search_faiss_ip(
+        doc_embeddings,
+        doc_embedding_source_indices,
+        query_embedding_out.m_embedding,
+        request.top_k
+    );
 
-    const size_t actual_top_k = std::min(request.top_k, scored.size());
+    const size_t actual_top_k = faiss_top_indices.size();
     std::vector<std::string> top_k_docs;
     top_k_docs.reserve(actual_top_k);
     for (size_t i = 0; i < actual_top_k; ++i) {
-        response.top_k_indices.push_back(scored[i].first);
-        top_k_docs.push_back(chunks[scored[i].first]);
+        response.top_k_indices.push_back(faiss_top_indices[i]);
+        top_k_docs.push_back(chunks[faiss_top_indices[i]]);
     }
     response.metrics.searching_ms = stage_timer.elapsed_time_ms();
     if (top_k_docs.empty()) {
