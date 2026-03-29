@@ -71,9 +71,15 @@ void ThreadPool::wait() {
 }
 
 void ThreadPool::thread_main(size_t thread_id) {
-    while (!m_exited) {
-        // uv_barrier_wait(&m_run_barrier); // when main thread runs, it will wait for all threads to reach this barrier
-        spin_barrier_wait(&m_run_barrier); // when main thread runs, it will wait for all threads to reach this barrier
+    while (true) {
+        // The destructor wakes workers through the same run barrier used for task dispatch.
+        // Workers must observe `m_exited` only after joining that barrier, otherwise they can
+        // exit from the loop early and leave the destroying thread stuck in `spin_barrier_wait`.
+        spin_barrier_wait(&m_run_barrier);
+
+        if (m_exited) {
+            break;
+        }
 
         if (m_current_task) {
             m_current_task(thread_id);
