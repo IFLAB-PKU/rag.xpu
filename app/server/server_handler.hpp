@@ -315,13 +315,6 @@ public:
             return m_context_slot_map.at(model_name);
         }
 
-#ifndef POWERSERVE_SERVER_MULTIMODEL
-    // Keep slot contexts alive for in-process PD overlap experiments.
-    if (!is_pd_slot_model_name(model_name)) {
-        destroy_all_models_unsafe();
-    }
-#endif // POWERSERVE_SERVER_MULTIMODEL
-
         const powerserve::Path main_model_path  = model_name_to_path(main_model_name);
         const powerserve::Path draft_model_path = draft_model_name.empty() ? "" : model_name_to_path(draft_model_name);
 
@@ -854,6 +847,29 @@ struct PDOrchestratorTask {
     std::promise<ModelOutput> result_promise;
 };
 
+inline std::shared_ptr<std::mutex> get_or_create_model_exec_mutex(const std::string &model_id) {
+    static std::mutex registry_lock;
+    static std::unordered_map<std::string, std::shared_ptr<std::mutex>> model_exec_lock_map;
+
+    std::lock_guard<std::mutex> lock_guard(registry_lock);
+    auto iter = model_exec_lock_map.find(model_id);
+    if (iter != model_exec_lock_map.end()) {
+        return iter->second;
+    }
+
+    auto mutex_ptr = std::make_shared<std::mutex>();
+    model_exec_lock_map.emplace(model_id, mutex_ptr);
+    return mutex_ptr;
+}
+
+inline std::unique_lock<std::mutex> lock_model_execution(const ModelContext &context) {
+    POWERSERVE_ASSERT(context.m_model_ptr != nullptr);
+    const std::string &model_id = context.m_model_ptr->m_config->model_id;
+    const auto mutex_ptr = get_or_create_model_exec_mutex(model_id);
+    POWERSERVE_ASSERT(mutex_ptr != nullptr);
+    return std::unique_lock<std::mutex>(*mutex_ptr);
+}
+
 class PDOrchestrator {
 public:
     PDOrchestrator() {
@@ -898,26 +914,12 @@ public:
 private:
     std::deque<PDOrchestratorTask> m_prefill_queue;
     std::deque<PDOrchestratorTask> m_decode_queue;
-    std::unordered_map<std::string, std::shared_ptr<std::mutex>> m_model_exec_lock_map;
     std::mutex m_lock;
     std::condition_variable m_prefill_cv;
     std::condition_variable m_decode_cv;
     std::thread m_prefill_worker;
     std::thread m_decode_worker;
     bool m_shutdown = false;
-
-private:
-    std::shared_ptr<std::mutex> get_model_exec_mutex(const std::string &model_id) {
-        std::lock_guard<std::mutex> lock_guard(m_lock);
-        auto iter = m_model_exec_lock_map.find(model_id);
-        if (iter != m_model_exec_lock_map.end()) {
-            return iter->second;
-        }
-
-        auto mutex_ptr = std::make_shared<std::mutex>();
-        m_model_exec_lock_map.emplace(model_id, mutex_ptr);
-        return mutex_ptr;
-    }
 
     void prefill_worker_loop() {
         while (true) {
@@ -949,7 +951,7 @@ private:
                 sampler_config.temperature     = input.m_temperature;
                 task.sampler_ptr = std::make_unique<powerserve::SamplerChain>(sampler_config, tokenizer);
 
-                task.model_exec_mutex = get_model_exec_mutex(context.m_model_ptr->m_config->model_id);
+                task.model_exec_mutex = get_or_create_model_exec_mutex(context.m_model_ptr->m_config->model_id);
                 POWERSERVE_ASSERT(task.model_exec_mutex != nullptr);
                 task.model_exec_lock = std::unique_lock<std::mutex>(*task.model_exec_mutex);
 
@@ -1174,6 +1176,7 @@ inline ModelOutput embedding(ServerContext &server_context, const ModelInput &in
     using namespace powerserve;
     /* Parse and concat user inputs */
     const ModelContext &context = server_context.setup_model(input.m_model);
+    auto model_exec_lock = lock_model_execution(context);
     const std::string input_prompt = input.m_prompt;
     return blocking_embedding(context, input, input_prompt);
 }
@@ -1181,6 +1184,7 @@ inline ModelOutput embedding(ServerContext &server_context, const ModelInput &in
 inline ModelOutput rerank(ServerContext &server_context, const ModelInput &input) {
     using namespace powerserve;
     const ModelContext &context = server_context.setup_model(input.m_model);
+    auto model_exec_lock = lock_model_execution(context);
     return blocking_rerank(context, input);
 }
 

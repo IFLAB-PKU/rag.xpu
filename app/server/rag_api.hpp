@@ -106,7 +106,9 @@ inline void handler_rag(ServerContext &server_context, const T_Request &request,
     }
 
     try {
-        const RagResponse rag_response = run_rag_sequential(server_context, rag_request);
+        const RagResponse rag_response = rag_request.mode == "hetero_parallel"
+            ? run_rag_hetero_parallel(server_context, rag_request)
+            : run_rag_sequential(server_context, rag_request);
         response_normal(dump_rag_response(rag_response), response);
         POWERSERVE_LOG_INFO("after rag: {}", powerserve::perf_get_mem_result());
     } catch (const std::invalid_argument &err) {

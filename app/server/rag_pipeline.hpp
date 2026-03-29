@@ -23,6 +23,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstddef>
+#include <future>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -93,31 +94,6 @@ inline std::string rag_first_line(const std::string &text) {
         return text;
     }
     return text.substr(0, pos);
-}
-
-inline bool rag_expansion_looks_like_answer(const std::string &text) {
-    if (text.empty()) {
-        return true;
-    }
-
-    size_t sentence_markers = 0;
-    for (const char ch : text) {
-        if (ch == '.' || ch == '!' || ch == '?') {
-            sentence_markers++;
-        }
-    }
-    if (sentence_markers >= 2) {
-        return true;
-    }
-
-    std::string lowered = text;
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-
-    return lowered.find("the answer is") != std::string::npos ||
-           lowered.find("it was") != std::string::npos ||
-           lowered.find("was started first") != std::string::npos;
 }
 
 inline std::vector<std::string> rag_split_document(const std::string &doc) {
@@ -253,6 +229,38 @@ inline std::string build_generation_prompt(const std::string &query, const std::
     return oss.str();
 }
 
+inline std::string maybe_expand_rag_query(
+    ServerContext &server_context,
+    const RagRequest &request,
+    size_t &query_expand_ms
+) {
+    using namespace powerserve;
+
+    query_expand_ms = 0;
+    if (!request.enable_query_expansion) {
+        return request.query;
+    }
+
+    Timer stage_timer;
+    const std::string model_for_expand = request.expansion_model.empty() ? request.generation_model : request.expansion_model;
+    const std::string expand_prompt =
+        "Rewrite the user query into one short retrieval query. "
+        "Do not answer the question.\n"
+        "Query: " + request.query + "\n"
+        "Rewrite:";
+
+    ModelInput expand_input = make_generation_input(request, expand_prompt);
+    expand_input.m_model = model_for_expand;
+    expand_input.m_temperature = 0.01F;
+    expand_input.m_max_num_token = std::min<size_t>(request.max_tokens, size_t{32});
+
+    const ModelOutput expand_output = completion(server_context, expand_input);
+    query_expand_ms = stage_timer.elapsed_time_ms();
+
+    const std::string candidate = rag_trim(rag_first_line(expand_output.m_text));
+    return candidate.empty() ? request.query : candidate;
+}
+
 inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRequest &request) {
     using namespace powerserve;
 
@@ -303,29 +311,8 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     }
 
     // 3) Query expansion (optional)
-    std::string expanded_query = request.query;
-    if (request.enable_query_expansion) {
-        stage_timer = Timer{};
-        const std::string model_for_expand = request.expansion_model.empty() ? request.generation_model : request.expansion_model;
-        const std::string expand_prompt =
-            "You are a search query rewriter. Rewrite the user query into one concise retrieval query. "
-            "Do not answer the question. Do not add facts. Output only one line.\n\n"
-            "User query: " + request.query + "\n"
-            "Rewritten query:";
-        ModelInput expand_input = make_generation_input(request, expand_prompt);
-        expand_input.m_model = model_for_expand;
-        expand_input.m_temperature = 0.01F;
-        expand_input.m_max_num_token = std::min<size_t>(request.max_tokens, size_t{48});
-        const ModelOutput expand_output = completion(server_context, expand_input);
-        const std::string candidate = rag_trim(rag_first_line(expand_output.m_text));
-        if (!candidate.empty() && candidate.size() <= 120 && !rag_expansion_looks_like_answer(candidate)) {
-            expanded_query = candidate;
-            response.query_used = expanded_query;
-        } else {
-            POWERSERVE_LOG_WARN("rag query expansion fallback to original query due to invalid expansion");
-        }
-        response.metrics.query_expand_ms = stage_timer.elapsed_time_ms();
-    }
+    const std::string expanded_query = maybe_expand_rag_query(server_context, request, response.metrics.query_expand_ms);
+    response.query_used = expanded_query;
 
     // 4) Query embedding
     stage_timer = Timer{};
@@ -382,6 +369,151 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     // 7) Generation
     stage_timer = Timer{};
     const std::string generation_prompt = build_generation_prompt(expanded_query, selected_context);
+    const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+    response.answer = generation_out.m_text;
+    response.context_chunks = std::move(selected_context);
+    response.metrics.generation_ms = stage_timer.elapsed_time_ms();
+
+    response.metrics.total_ms = total_timer.elapsed_time_ms();
+    return response;
+}
+
+inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const RagRequest &request) {
+    using namespace powerserve;
+
+    if (request.doc.empty()) {
+        throw std::invalid_argument("'doc' must not be empty");
+    }
+    if (request.query.empty()) {
+        throw std::invalid_argument("'query' must not be empty");
+    }
+    if (request.generation_model.empty() || request.embedding_model.empty() || request.rerank_model.empty()) {
+        throw std::invalid_argument("'generation_model', 'embedding_model', and 'rerank_model' are required");
+    }
+
+    struct DocBranchOutput {
+        std::vector<std::string> chunks;
+        std::vector<std::vector<float>> doc_embeddings;
+        std::vector<size_t> doc_embedding_source_indices;
+        size_t indexing_ms = 0;
+        size_t doc_embedding_ms = 0;
+    };
+
+    struct QueryBranchOutput {
+        std::string expanded_query;
+        size_t query_expand_ms = 0;
+    };
+
+    RagResponse response;
+    response.mode_requested = request.mode;
+    response.mode_used = "hetero_parallel";
+    response.query_used = request.query;
+
+    Timer total_timer;
+
+    auto doc_branch_future = std::async(std::launch::async, [&server_context, &request]() -> DocBranchOutput {
+        DocBranchOutput out;
+
+        Timer stage_timer;
+        out.chunks = rag_split_document(request.doc);
+        out.indexing_ms = stage_timer.elapsed_time_ms();
+        if (out.chunks.empty()) {
+            throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
+        }
+
+        stage_timer = Timer{};
+        out.doc_embeddings.reserve(out.chunks.size());
+        out.doc_embedding_source_indices.reserve(out.chunks.size());
+        for (size_t chunk_idx = 0; chunk_idx < out.chunks.size(); ++chunk_idx) {
+            const auto &chunk = out.chunks[chunk_idx];
+            const ModelOutput doc_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, chunk));
+            if (doc_embedding_out.m_embedding.empty()) {
+                continue;
+            }
+            out.doc_embeddings.push_back(doc_embedding_out.m_embedding);
+            out.doc_embedding_source_indices.push_back(chunk_idx);
+        }
+        out.doc_embedding_ms = stage_timer.elapsed_time_ms();
+
+        if (out.doc_embeddings.empty()) {
+            throw std::runtime_error("all document embeddings are empty");
+        }
+        return out;
+    });
+
+    auto query_branch_future = std::async(std::launch::async, [&server_context, &request]() -> QueryBranchOutput {
+        QueryBranchOutput out;
+        out.expanded_query = maybe_expand_rag_query(server_context, request, out.query_expand_ms);
+        return out;
+    });
+
+    const DocBranchOutput doc_branch = doc_branch_future.get();
+    const QueryBranchOutput query_branch = query_branch_future.get();
+    response.query_used = query_branch.expanded_query;
+
+    // Query embedding is intentionally executed after both async branches complete.
+    // This avoids concurrent execution on the same embedding model instance.
+    Timer stage_timer;
+    const ModelOutput query_embedding_out = embedding(
+        server_context,
+        make_embedding_input(request.embedding_model, query_branch.expanded_query)
+    );
+    if (query_embedding_out.m_embedding.empty()) {
+        throw std::runtime_error("query embedding is empty");
+    }
+    response.metrics.query_embedding_ms = stage_timer.elapsed_time_ms();
+
+    response.metrics.indexing_ms = doc_branch.indexing_ms;
+    response.metrics.doc_embedding_ms = doc_branch.doc_embedding_ms;
+    response.metrics.query_expand_ms = query_branch.query_expand_ms;
+    response.metrics.embedding_ms = response.metrics.doc_embedding_ms + response.metrics.query_embedding_ms;
+
+    // Searching
+    stage_timer = Timer{};
+    const std::vector<size_t> faiss_top_indices = rag_search_faiss_ip(
+        doc_branch.doc_embeddings,
+        doc_branch.doc_embedding_source_indices,
+        query_embedding_out.m_embedding,
+        request.top_k
+    );
+
+    const size_t actual_top_k = faiss_top_indices.size();
+    std::vector<std::string> top_k_docs;
+    top_k_docs.reserve(actual_top_k);
+    for (size_t i = 0; i < actual_top_k; ++i) {
+        response.top_k_indices.push_back(faiss_top_indices[i]);
+        top_k_docs.push_back(doc_branch.chunks[faiss_top_indices[i]]);
+    }
+    response.metrics.searching_ms = stage_timer.elapsed_time_ms();
+    if (top_k_docs.empty()) {
+        throw std::runtime_error("retrieval returns empty top_k docs");
+    }
+
+    // Reranking
+    stage_timer = Timer{};
+    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, query_branch.expanded_query, top_k_docs));
+
+    std::vector<std::string> selected_context;
+    for (const auto &item : rerank_out.m_rerank_results) {
+        if (item.index >= top_k_docs.size()) {
+            continue;
+        }
+        response.top_n_indices.push_back(response.top_k_indices[item.index]);
+        selected_context.push_back(top_k_docs[item.index]);
+    }
+
+    if (selected_context.empty()) {
+        const size_t fallback_n = std::min(request.top_n, top_k_docs.size());
+        for (size_t i = 0; i < fallback_n; ++i) {
+            response.top_n_indices.push_back(response.top_k_indices[i]);
+            selected_context.push_back(top_k_docs[i]);
+        }
+    }
+    response.metrics.reranking_ms = stage_timer.elapsed_time_ms();
+
+    // Generation
+    stage_timer = Timer{};
+    const std::string generation_prompt = build_generation_prompt(query_branch.expanded_query, selected_context);
     const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
     response.answer = generation_out.m_text;
     response.context_chunks = std::move(selected_context);
