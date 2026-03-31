@@ -14,35 +14,25 @@
 
 #pragma once
 
-namespace powerserve {
+#include <string>
 
-enum class OpType {
-    NONE = 0,
+namespace powerserve::ggml {
 
-    ADD,
-    MAT_MUL,
-    RMS_NORM,
-    SILU_HADAMARD,
-    ROPE,
-    SOFTMAX,
-    COPY,
+struct GGMLClusterManager;
+struct GGMLKVPager;
 
-#if defined(POWERSERVE_WITH_QNN)
-    QNN_FORWARD,
-    QNN_FORWARD_VL,
-#endif
-
-    PRINT,
-    GET_EMBEDDING,
-    ADD_CACHE,
-    PERMUTE,
-    CONT,
-    VIEW,
-    SOFTMAX_EXT,
-    CLUSTER_ATTN,
-    GET_MASK,
-    TRANSPOSE,
-    INSERT_IMG_EMBEDDIGN,
+struct GGMLClusterRuntimeView {
+    const GGMLClusterManager *manager = nullptr;
+    const GGMLKVPager *pager = nullptr;
+    bool ready = false;
 };
 
-} // namespace powerserve
+void register_cluster_runtime(
+    const std::string &model_id,
+    const GGMLClusterManager *manager,
+    const GGMLKVPager *pager
+);
+void set_cluster_runtime_ready(const std::string &model_id, bool ready);
+auto get_cluster_runtime(const std::string &model_id) -> GGMLClusterRuntimeView;
+
+} // namespace powerserve::ggml

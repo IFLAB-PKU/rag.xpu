@@ -1,0 +1,55 @@
+datasets = [
+    [
+        dict(
+            abbr='LongBench_hotpotqa',
+            eval_cfg=dict(
+                evaluator=dict(
+                    type='opencompass.datasets.LongBenchF1Evaluator'),
+                pred_role='BOT'),
+            infer_cfg=dict(
+                inferencer=dict(
+                    max_out_len=32,
+                    type='opencompass.openicl.icl_inferencer.GenInferencer'),
+                prompt_template=dict(
+                    template=dict(round=[
+                        dict(
+                            prompt=
+                            'Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:',
+                            role='HUMAN'),
+                    ]),
+                    type=
+                    'opencompass.openicl.icl_prompt_template.PromptTemplate'),
+                retriever=dict(
+                    type='opencompass.openicl.icl_retriever.ZeroRetriever')),
+            name='hotpotqa',
+            path='opencompass/Longbench',
+            reader_cfg=dict(
+                input_columns=[
+                    'context',
+                    'input',
+                ],
+                output_column='answers',
+                test_range='[5:50]',
+                test_split='test',
+                train_split='test'),
+            type='opencompass.datasets.LongBenchhotpotqaDataset'),
+    ],
+]
+models = [
+    dict(
+        abbr='qwen2_0p5b_android_cluster_topk8',
+        batch_size=1,
+        binary_path=
+        '/data/local/tmp/ziqian/models/qwen2-0.5b-work/bin/powerserve-run',
+        cluster_topk=8,
+        device_serial='3B15CR0014H00000',
+        max_seq_len=16384,
+        n_predicts=32,
+        path='qwen2-0.5b-android-cluster',
+        prompt_file='/data/local/tmp/ziqian/prompts.txt',
+        query_per_second=1,
+        type='opencompass.models.AndroidADBModel',
+        use_cluster=True,
+        work_folder='/data/local/tmp/ziqian/models/qwen2-0.5b-work'),
+]
+work_dir = '/home/frp/ziqian/opencompass_runs/outputs_hotpotqa/20260328_215921'
