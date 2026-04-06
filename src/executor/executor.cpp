@@ -1,33 +1,45 @@
-// Copyright 2024-2025 PowerServe Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include "executor/executor.hpp"
 
 #include "backend/ggml/ggml.hpp"
+#include "backend/ggml/ggml_cluster_manager.hpp"
 #include "core/logger.hpp"
+#include "model/module/ggml_cluster_runtime.hpp"
 
 #include <cstdint>
-#include <unordered_set>
-#include <cstdint>
-#include <array>
-#include <string>
 #include <cstdlib>
 #include <cstring>
-#include <fmt/core.h>
-
+#include <unordered_set>
 
 namespace powerserve {
+
+namespace {
+
+auto copy_tensor_f32_contiguous(const Tensor *tensor) -> std::vector<float> {
+    POWERSERVE_ASSERT(tensor != nullptr);
+    POWERSERVE_ASSERT(tensor->m_dtype == DataType::FP32);
+    const auto &buffer = tensor->get<CPUBuffer>();
+    const auto *base = static_cast<const char *>(buffer.m_data);
+    std::vector<float> out;
+    out.reserve(tensor->n_elements());
+    for (size_t i3 = 0; i3 < tensor->m_shape[3]; ++i3) {
+        for (size_t i2 = 0; i2 < tensor->m_shape[2]; ++i2) {
+            for (size_t i1 = 0; i1 < tensor->m_shape[1]; ++i1) {
+                for (size_t i0 = 0; i0 < tensor->m_shape[0]; ++i0) {
+                    const auto *ptr = reinterpret_cast<const float *>(
+                        base + i3 * buffer.m_stride[3] +
+                        i2 * buffer.m_stride[2] +
+                        i1 * buffer.m_stride[1] +
+                        i0 * buffer.m_stride[0]
+                    );
+                    out.push_back(*ptr);
+                }
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace
 
 static inline bool force_get_mask_cpu_fallback() {
     static int cached = -1;
@@ -45,8 +57,6 @@ static inline bool force_get_mask_cpu_fallback() {
     return cached == 1;
 }
 
-// ziqian add: debug hook impl and other debug tools
-// ===== Debug hook impl =====
 static OpAfterExecHook g_after_exec_hook = nullptr;
 
 void set_op_after_exec_hook(OpAfterExecHook hook) {
@@ -56,71 +66,6 @@ void set_op_after_exec_hook(OpAfterExecHook hook) {
 OpAfterExecHook & get_op_after_exec_hook() {
     return g_after_exec_hook;
 }
-
-// 简单稳定 hash：FNV-1a 64-bit
-static inline uint64_t fnv1a_u64(uint64_t h, uint64_t x) {
-    constexpr uint64_t FNV_PRIME = 1099511628211ull;
-    h ^= x;
-    h *= FNV_PRIME;
-    return h;
-}
-
-static inline uint64_t hash_u64(uint64_t h, uint64_t x) {
-    return fnv1a_u64(h, x);
-}
-
-// 把 dtype/shape 编码进 hash
-static inline uint64_t hash_tensor_meta(uint64_t h, const powerserve::Tensor *t) {
-    if (!t) {
-        return hash_u64(h, 0xdeadbeefull);
-    }
-    h = hash_u64(h, (uint64_t)t->m_dtype);
-
-    // 形状固定 4 维
-    auto sh = t->m_shape;
-    h = hash_u64(h, (uint64_t)sh[0]);
-    h = hash_u64(h, (uint64_t)sh[1]);
-    h = hash_u64(h, (uint64_t)sh[2]);
-    h = hash_u64(h, (uint64_t)sh[3]);
-
-    // view / buffer-kind 也可以编码（可选）
-    h = hash_u64(h, (uint64_t)(t->m_data ? 1 : 0));
-
-    return h;
-}
-
-// 对整个 ops 列表做 signature hash
-static uint64_t hash_ops_signature(const std::vector<std::shared_ptr<powerserve::OpNode>> &ops) {
-    uint64_t h = 1469598103934665603ull; // FNV offset basis
-    h = hash_u64(h, (uint64_t)ops.size());
-
-    for (size_t i = 0; i < ops.size(); ++i) {
-        const auto &op = ops[i];
-        if (!op) {
-            h = hash_u64(h, 0xabad1deau);
-            continue;
-        }
-
-        h = hash_u64(h, (uint64_t)op->op);        // op type
-        h = hash_u64(h, (uint64_t)op->prev.size());
-        h = hash_u64(h, (uint64_t)op->next.size());
-
-        // prev tensors meta
-        for (auto &p : op->prev) {
-            const powerserve::Tensor *t = p ? p->tensor() : nullptr;
-            h = hash_tensor_meta(h, t);
-        }
-
-        // next tensors meta
-        for (auto &n : op->next) {
-            const powerserve::Tensor *t = n ? n->tensor() : nullptr;
-            h = hash_tensor_meta(h, t);
-        }
-    }
-
-    return h;
-}
-// ziqian: end
 
 // ziqian：增加通过后端决定分配buffer类型
 void Executor::allocate_buffers() {
@@ -473,6 +418,23 @@ void Executor::run() {
             auto [scale, max_bias] = op->get_params<SoftmaxExtParams>();
 
             backend->softmax_ext(out, x, mask, scale, max_bias);
+        } break;
+
+        case OpType::CLUSTER_UPDATE: {
+            POWERSERVE_ASSERT(!use_opencl, "CLUSTER_UPDATE is currently only implemented on GGML/CPU");
+            const auto &params = op->get_params<ClusterUpdateParams>();
+            const auto runtime = powerserve::ggml::get_cluster_runtime(params.model_id);
+            POWERSERVE_ASSERT(runtime.manager != nullptr, "CLUSTER_UPDATE missing cluster manager");
+            auto *k = op->prev[0]->tensor();
+            auto *v = op->prev[1]->tensor();
+            auto new_k = copy_tensor_f32_contiguous(k);
+            auto new_v = copy_tensor_f32_contiguous(v);
+            runtime.manager->update_layer_after_decode(
+                static_cast<size_t>(params.layer_id),
+                params.token_position,
+                new_k,
+                new_v
+            );
         } break;
 
         case OpType::CLUSTER_ATTN: {
