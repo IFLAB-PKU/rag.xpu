@@ -862,10 +862,14 @@ inline std::shared_ptr<std::mutex> get_or_create_model_exec_mutex(const std::str
     return mutex_ptr;
 }
 
-inline std::unique_lock<std::mutex> lock_model_execution(const ModelContext &context) {
+inline std::string get_model_exec_lock_key(const ModelContext &context) {
     POWERSERVE_ASSERT(context.m_model_ptr != nullptr);
-    const std::string &model_id = context.m_model_ptr->m_config->model_id;
-    const auto mutex_ptr = get_or_create_model_exec_mutex(model_id);
+    return context.m_model_ptr->m_config->model_id;
+}
+
+inline std::unique_lock<std::mutex> lock_model_execution(const ModelContext &context) {
+    const std::string lock_key = get_model_exec_lock_key(context);
+    const auto mutex_ptr = get_or_create_model_exec_mutex(lock_key);
     POWERSERVE_ASSERT(mutex_ptr != nullptr);
     return std::unique_lock<std::mutex>(*mutex_ptr);
 }
@@ -951,7 +955,7 @@ private:
                 sampler_config.temperature     = input.m_temperature;
                 task.sampler_ptr = std::make_unique<powerserve::SamplerChain>(sampler_config, tokenizer);
 
-                task.model_exec_mutex = get_or_create_model_exec_mutex(context.m_model_ptr->m_config->model_id);
+                task.model_exec_mutex = get_or_create_model_exec_mutex(get_model_exec_lock_key(context));
                 POWERSERVE_ASSERT(task.model_exec_mutex != nullptr);
                 task.model_exec_lock = std::unique_lock<std::mutex>(*task.model_exec_mutex);
 

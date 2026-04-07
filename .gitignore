@@ -23,6 +23,7 @@ compare*.py
 *.csv
 
 docs/pd_split_baseline_contract.md
+docs/pd_slot_warning.md
 old-compare-log/
 docs/timeout-reason.md
 tests/pd-bench-*.csv

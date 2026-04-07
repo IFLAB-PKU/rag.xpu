@@ -441,9 +441,7 @@ auto Qwen3Model::compute_rerank_score(const std::vector<Token> &tokens, size_t b
         // 4. Execution
         Executor executor(*m_platform, g);
         executor.allocate_buffers();
-        POWERSERVE_LOG_INFO("Rerank: Executing batch of size {}", current_bs);
         executor.run();
-        POWERSERVE_LOG_INFO("Rerank: Execution complete for batch size {}", current_bs);
 
 #if defined(POWERSERVE_WITH_QNN)
         if (!m_platform->qnn_backend)

@@ -447,21 +447,27 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
         return out;
     });
 
-    const DocBranchOutput doc_branch = doc_branch_future.get();
     const QueryBranchOutput query_branch = query_branch_future.get();
     response.query_used = query_branch.expanded_query;
 
-    // Query embedding is intentionally executed after both async branches complete.
-    // This avoids concurrent execution on the same embedding model instance.
+    std::future<ModelOutput> query_embedding_future;
+    Timer query_embedding_timer;
+    query_embedding_timer = Timer{};
+    query_embedding_future = std::async(std::launch::async, [&server_context, &request, &query_branch]() {
+        return embedding(
+            server_context,
+            make_embedding_input(request.embedding_model, query_branch.expanded_query)
+        );
+    });
+
+    const DocBranchOutput doc_branch = doc_branch_future.get();
+
+    const ModelOutput query_embedding_out = query_embedding_future.get();
     Timer stage_timer;
-    const ModelOutput query_embedding_out = embedding(
-        server_context,
-        make_embedding_input(request.embedding_model, query_branch.expanded_query)
-    );
+    response.metrics.query_embedding_ms = query_embedding_timer.elapsed_time_ms();
     if (query_embedding_out.m_embedding.empty()) {
         throw std::runtime_error("query embedding is empty");
     }
-    response.metrics.query_embedding_ms = stage_timer.elapsed_time_ms();
 
     response.metrics.indexing_ms = doc_branch.indexing_ms;
     response.metrics.doc_embedding_ms = doc_branch.doc_embedding_ms;
