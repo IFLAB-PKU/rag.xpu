@@ -38,6 +38,7 @@ payload = {
     'enable_query_expansion': True,
     'top_k': 20,
     'top_n': 5,
+    'generation_decode_steps': 192,
     'max_tokens': 192,
     'temperature': 0.1,
 }

@@ -33,6 +33,7 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
     rag_request.top_k = request.value("top_k", size_t{20});
     rag_request.top_n = request.value("top_n", size_t{5});
     rag_request.max_tokens = request.value("max_tokens", size_t{128});
+    rag_request.generation_decode_steps = request.value("generation_decode_steps", size_t{64});
     rag_request.temperature = request.value("temperature", 0.2F);
 
     rag_request.generation_model = request.value("generation_model", request.value("model", std::string{}));
@@ -48,6 +49,9 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
     }
     if (rag_request.top_n > rag_request.top_k) {
         throw std::invalid_argument("'top_n' must be <= 'top_k'");
+    }
+    if (rag_request.generation_decode_steps == 0) {
+        throw std::invalid_argument("'generation_decode_steps' must be > 0");
     }
 
     return rag_request;
@@ -75,7 +79,11 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
         {"debug",
          {{"top_k_indices", response.top_k_indices},
                     {"top_n_indices", response.top_n_indices},
-                    {"sub_queries", response.sub_queries}}},
+                    {"sub_queries", response.sub_queries},
+                    {"generation_segmented_prefill_used", response.generation_segmented_prefill_used},
+                    {"generation_decode_steps_configured", response.generation_decode_steps_configured},
+                    {"generation_decode_steps", response.generation_decode_steps},
+                    {"generation_segment_chars", response.generation_segment_chars}}},
         {"stage_metrics_ms",
          {{"indexing", response.metrics.indexing_ms},
           {"query_expand", response.metrics.query_expand_ms},

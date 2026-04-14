@@ -46,6 +46,7 @@ struct RagRequest {
     size_t top_k = 20;
     size_t top_n = 5;
     size_t max_tokens = 128;
+    size_t generation_decode_steps = 64;
     float temperature = 0.2F;
 };
 
@@ -67,6 +68,10 @@ struct RagResponse {
     std::string mode_used;
     std::string query_used;
     std::vector<std::string> sub_queries;
+    bool generation_segmented_prefill_used = false;
+    size_t generation_decode_steps_configured = 1;
+    size_t generation_decode_steps = 0;
+    std::vector<size_t> generation_segment_chars;
     std::vector<std::string> context_chunks;
     std::vector<size_t> top_k_indices;
     std::vector<size_t> top_n_indices;
@@ -325,6 +330,39 @@ inline std::string build_generation_prompt(const std::string &query, const std::
     return oss.str();
 }
 
+inline std::vector<std::string> build_generation_segments(
+    const std::string &query,
+    const std::vector<std::string> &sub_queries,
+    const std::vector<std::string> &context_chunks
+) {
+    std::vector<std::string> segments;
+    segments.reserve(3);
+
+    std::ostringstream segment_1;
+    segment_1 << "You are a concise and faithful QA assistant. Use only the provided context.\n";
+    segment_1 << "Question: " << query << "\n";
+    segments.push_back(segment_1.str());
+
+    if (!sub_queries.empty()) {
+        std::ostringstream segment_2;
+        segment_2 << "Sub-query hints:\n";
+        for (const auto &sub_query : sub_queries) {
+            segment_2 << "- " << sub_query << "\n";
+        }
+        segments.push_back(segment_2.str());
+    }
+
+    std::ostringstream segment_3;
+    segment_3 << "Context:\n";
+    for (const auto &chunk : context_chunks) {
+        segment_3 << "- " << chunk << "\n";
+    }
+    segment_3 << "Answer:";
+    segments.push_back(segment_3.str());
+
+    return segments;
+}
+
 inline std::string maybe_expand_rag_query(
     ServerContext &server_context,
     const RagRequest &request,
@@ -496,9 +534,37 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
     // 7) Generation
     stage_timer = Timer{};
-    const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
-    const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+    const std::vector<std::string> generation_segments =
+        build_generation_segments(request.query, response.sub_queries, selected_context);
+
+    ModelOutput generation_out;
+    bool segmented_prefill_used = false;
+    try {
+        ModelInput generation_input = make_generation_input(request, generation_segments.front());
+        const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
+        auto generation_model_lock = lock_model_execution(generation_context);
+        generation_out = blocking_inference_segmented_prefill_prototype(
+            generation_context,
+            generation_input,
+            generation_segments,
+            request.generation_decode_steps
+        );
+        segmented_prefill_used = true;
+    } catch (...) {
+        const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
+        generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+    }
+
     response.answer = generation_out.m_text;
+    response.generation_segmented_prefill_used = segmented_prefill_used;
+    response.generation_decode_steps_configured = request.generation_decode_steps;
+    response.generation_decode_steps =
+        generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
+    response.generation_segment_chars.clear();
+    response.generation_segment_chars.reserve(generation_segments.size());
+    for (const auto &segment : generation_segments) {
+        response.generation_segment_chars.push_back(segment.size());
+    }
     response.context_chunks = std::move(selected_context);
     response.metrics.generation_ms = stage_timer.elapsed_time_ms();
 
