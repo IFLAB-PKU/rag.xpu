@@ -27,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -65,6 +66,7 @@ struct RagResponse {
     std::string mode_requested;
     std::string mode_used;
     std::string query_used;
+    std::vector<std::string> sub_queries;
     std::vector<std::string> context_chunks;
     std::vector<size_t> top_k_indices;
     std::vector<size_t> top_n_indices;
@@ -94,6 +96,66 @@ inline std::string rag_first_line(const std::string &text) {
         return text;
     }
     return text.substr(0, pos);
+}
+
+inline std::string rag_replace_fullwidth_semicolon(std::string s) {
+    static const std::string fullwidth = "；";
+    size_t pos = 0;
+    while ((pos = s.find(fullwidth, pos)) != std::string::npos) {
+        s.replace(pos, fullwidth.size(), ";");
+        pos += 1;
+    }
+    return s;
+}
+
+inline std::vector<std::string> rag_split_sub_queries(
+    const std::string &expanded,
+    size_t max_subqueries = 3,
+    size_t max_subquery_chars = 128
+) {
+    std::vector<std::string> out;
+    std::string normalized = rag_replace_fullwidth_semicolon(rag_first_line(expanded));
+    std::string current;
+
+    auto push_token = [&](std::string token) {
+        token = rag_trim(std::move(token));
+        while (!token.empty() && (token.front() == '-' || token.front() == '*' || token.front() == ';')) {
+            token.erase(token.begin());
+            token = rag_trim(std::move(token));
+        }
+        if (token.empty()) {
+            return;
+        }
+        if (token.size() > max_subquery_chars) {
+            token.resize(max_subquery_chars);
+            token = rag_trim(std::move(token));
+        }
+        if (token.empty()) {
+            return;
+        }
+        if (std::find(out.begin(), out.end(), token) != out.end()) {
+            return;
+        }
+        out.push_back(std::move(token));
+    };
+
+    for (const char ch : normalized) {
+        if (ch == ';') {
+            push_token(std::move(current));
+            current.clear();
+            if (out.size() >= max_subqueries) {
+                break;
+            }
+            continue;
+        }
+        current.push_back(ch);
+    }
+
+    if (out.size() < max_subqueries) {
+        push_token(std::move(current));
+    }
+
+    return out;
 }
 
 inline std::vector<std::string> rag_split_document(const std::string &doc) {
@@ -177,6 +239,40 @@ inline std::vector<size_t> rag_search_faiss_ip(
     return top_indices;
 }
 
+inline std::vector<size_t> rag_merge_subquery_hits(
+    const std::vector<std::vector<size_t>> &per_query_hits,
+    size_t top_k
+) {
+    std::unordered_map<size_t, float> score_by_index;
+    for (const auto &hits : per_query_hits) {
+        for (size_t rank = 0; rank < hits.size(); ++rank) {
+            const size_t idx = hits[rank];
+            score_by_index[idx] += 1.0F / (1.0F + static_cast<float>(rank));
+        }
+    }
+
+    std::vector<std::pair<size_t, float>> scored_hits;
+    scored_hits.reserve(score_by_index.size());
+    for (const auto &[idx, score] : score_by_index) {
+        scored_hits.emplace_back(idx, score);
+    }
+
+    std::sort(scored_hits.begin(), scored_hits.end(), [](const auto &a, const auto &b) {
+        if (a.second != b.second) {
+            return a.second > b.second;
+        }
+        return a.first < b.first;
+    });
+
+    const size_t keep_n = std::min(top_k, scored_hits.size());
+    std::vector<size_t> merged_indices;
+    merged_indices.reserve(keep_n);
+    for (size_t i = 0; i < keep_n; ++i) {
+        merged_indices.push_back(scored_hits[i].first);
+    }
+    return merged_indices;
+}
+
 inline ModelInput make_generation_input(const RagRequest &request, const std::string &prompt) {
     return ModelInput{
         .m_model = request.generation_model,
@@ -244,17 +340,22 @@ inline std::string maybe_expand_rag_query(
     Timer stage_timer;
     const std::string model_for_expand = request.expansion_model.empty() ? request.generation_model : request.expansion_model;
     const std::string expand_prompt =
-        "Rewrite the user query into one short retrieval query. "
-        "Do not answer the question.\n"
-        "Query: " + request.query + "\n"
-        "Rewrite:";
+        "You are a query rewriter for a retrieval system. "
+    "Given the user's query, generate three different sub-queries. "
+    "Each sub-query should focus on a distinct aspect or phrasing of the original query. "
+    "Return the three sub-queries on a single line, separated by semicolon(;). "
+    "Do NOT use numbers. "
+    "Do NOT answer the query. "
+    "Query: " + request.query + "\n"
+    "Your output:";
 
     ModelInput expand_input = make_generation_input(request, expand_prompt);
     expand_input.m_model = model_for_expand;
-    expand_input.m_temperature = 0.01F;
-    expand_input.m_max_num_token = std::min<size_t>(request.max_tokens, size_t{32});
+    expand_input.m_temperature = 0.2F;
+    expand_input.m_max_num_token = std::min<size_t>(request.max_tokens, size_t{96});
 
     const ModelOutput expand_output = completion(server_context, expand_input);
+    printf("Query expansion output: %s\n", expand_output.m_text.c_str());
     query_expand_ms = stage_timer.elapsed_time_ms();
 
     const std::string candidate = rag_trim(rag_first_line(expand_output.m_text));
@@ -312,32 +413,59 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
     // 3) Query expansion (optional)
     const std::string expanded_query = maybe_expand_rag_query(server_context, request, response.metrics.query_expand_ms);
-    response.query_used = expanded_query;
 
-    // 4) Query embedding
+    // Phase A: in sequential mode, cache split sub-queries for later phases.
+    if (request.enable_query_expansion) {
+        // Keep split step for pipeline shape, then force fixed sub-queries for temporary experiments.
+        const auto parsed_sub_queries = rag_split_sub_queries(expanded_query);
+        (void)parsed_sub_queries;
+        response.sub_queries = {
+            "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
+            "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
+            "OpenAI 在安全方面的发展中体现了哪些权衡取舍?"
+        };
+    }
+    const std::vector<std::string> retrieval_queries =
+        response.sub_queries.empty() ? std::vector<std::string>{expanded_query} : response.sub_queries;
+    response.query_used = request.query;
+
+    // 4) Query embeddings (all sub-queries first)
     stage_timer = Timer{};
-    const ModelOutput query_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, expanded_query));
-    if (query_embedding_out.m_embedding.empty()) {
-        throw std::runtime_error("query embedding is empty");
+    std::vector<std::vector<float>> query_embeddings;
+    query_embeddings.reserve(retrieval_queries.size());
+    for (const auto &sub_query : retrieval_queries) {
+        const ModelOutput query_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, sub_query));
+        if (query_embedding_out.m_embedding.empty()) {
+            continue;
+        }
+        query_embeddings.push_back(query_embedding_out.m_embedding);
+    }
+    if (query_embeddings.empty()) {
+        throw std::runtime_error("all query embeddings are empty");
     }
     response.metrics.query_embedding_ms = stage_timer.elapsed_time_ms();
     response.metrics.embedding_ms += response.metrics.query_embedding_ms;
 
-    // 5) Searching (FAISS IndexFlatIP)
+    // 5) Searching (all sub-queries, then merge/dedup)
     stage_timer = Timer{};
-    const std::vector<size_t> faiss_top_indices = rag_search_faiss_ip(
-        doc_embeddings,
-        doc_embedding_source_indices,
-        query_embedding_out.m_embedding,
-        request.top_k
-    );
+    std::vector<std::vector<size_t>> per_query_top_indices;
+    per_query_top_indices.reserve(query_embeddings.size());
+    for (const auto &query_embedding : query_embeddings) {
+        per_query_top_indices.push_back(rag_search_faiss_ip(
+            doc_embeddings,
+            doc_embedding_source_indices,
+            query_embedding,
+            request.top_k
+        ));
+    }
+    const std::vector<size_t> merged_top_indices = rag_merge_subquery_hits(per_query_top_indices, request.top_k);
 
-    const size_t actual_top_k = faiss_top_indices.size();
+    const size_t actual_top_k = merged_top_indices.size();
     std::vector<std::string> top_k_docs;
     top_k_docs.reserve(actual_top_k);
     for (size_t i = 0; i < actual_top_k; ++i) {
-        response.top_k_indices.push_back(faiss_top_indices[i]);
-        top_k_docs.push_back(chunks[faiss_top_indices[i]]);
+        response.top_k_indices.push_back(merged_top_indices[i]);
+        top_k_docs.push_back(chunks[merged_top_indices[i]]);
     }
     response.metrics.searching_ms = stage_timer.elapsed_time_ms();
     if (top_k_docs.empty()) {
@@ -346,7 +474,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
     // 6) Reranking
     stage_timer = Timer{};
-    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, expanded_query, top_k_docs));
+    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
 
     std::vector<std::string> selected_context;
     for (const auto &item : rerank_out.m_rerank_results) {
@@ -368,7 +496,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
     // 7) Generation
     stage_timer = Timer{};
-    const std::string generation_prompt = build_generation_prompt(expanded_query, selected_context);
+    const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
     const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
     response.answer = generation_out.m_text;
     response.context_chunks = std::move(selected_context);
