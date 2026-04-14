@@ -154,6 +154,37 @@ struct ModelTokenIterator : TokenIterator {
 public:
     Model &m_model;
 
+private:
+    void prefill_prompt_tokens(const std::vector<Token> &prompt_tokens) {
+        if (prompt_tokens.empty()) {
+            return;
+        }
+
+        const size_t n_prompt_tokens = prompt_tokens.size();
+        auto &m_platform             = m_model.m_platform;
+        auto &model_id               = m_model.m_config->model_id;
+
+        size_t n_prefilled = 0;
+        size_t position    = m_platform->get_kv_position(model_id);
+
+        while (n_prefilled < n_prompt_tokens - 1) {
+            size_t bs = std::min(m_batch_size, n_prompt_tokens - n_prefilled - 1);
+            std::vector<Token> tokens;
+            std::copy(
+                prompt_tokens.begin() + n_prefilled,
+                prompt_tokens.begin() + n_prefilled + bs,
+                std::back_inserter(tokens)
+            );
+            std::vector<int> pos(bs);
+            std::iota(pos.begin(), pos.end(), position);
+            m_model.decode(m_sampler, tokens, pos, false);
+            position = m_platform->get_kv_position(model_id);
+            n_prefilled += bs;
+        }
+
+        m_tokens.push_back(prompt_tokens.back());
+    }
+
 public:
     ModelTokenIterator(
         Model &model,
@@ -171,33 +202,28 @@ public:
 
         bool add_special_tokens = m_tokenizer.m_vocab.tokenizer_add_bos || m_tokenizer.m_vocab.tokenizer_add_eos;
         auto prompt_tokens   = m_tokenizer.tokenize(m_prompt, add_special_tokens);
-        // POWERSERVE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens);
-        auto n_prompt_tokens = prompt_tokens.size();
-        size_t n_prefilled   = 0;
-        size_t position      = 0;
-
-        auto &m_platform = m_model.m_platform;
-        auto &model_id   = m_model.m_config->model_id;
+        auto &m_platform      = m_model.m_platform;
+        auto &model_id        = m_model.m_config->model_id;
         m_platform->reset_kv_position(model_id);
-        position = m_platform->get_kv_position(model_id);
         m_platform->ggml_backends[model_id]->setup_threadpool();
-        // prefill
-        while (n_prefilled < n_prompt_tokens - 1) {
-            size_t bs = std::min(m_batch_size, n_prompt_tokens - n_prefilled - 1);
-            std::vector<Token> tokens;
-            std::copy(
-                prompt_tokens.begin() + n_prefilled,
-                prompt_tokens.begin() + n_prefilled + bs,
-                std::back_inserter(tokens)
-            );
-            std::vector<int> pos(bs);
-            std::iota(pos.begin(), pos.end(), position);
-            m_model.decode(m_sampler, tokens, pos, false);
-            position = m_platform->get_kv_position(model_id);
-            n_prefilled += bs;
+        prefill_prompt_tokens(prompt_tokens);
+    }
+
+    void prefill_segment_tokens(const std::vector<Token> &segment_tokens) {
+        if (segment_tokens.empty()) {
+            return;
         }
-        position = m_platform->get_kv_position(model_id);
-        m_tokens.push_back(prompt_tokens.back());
+
+        std::vector<Token> composed_tokens;
+        composed_tokens.reserve(segment_tokens.size() + (m_tokens.empty() ? 0 : 1));
+
+        if (!m_tokens.empty()) {
+            composed_tokens.push_back(m_tokens.front());
+            m_tokens.clear();
+        }
+
+        std::copy(segment_tokens.begin(), segment_tokens.end(), std::back_inserter(composed_tokens));
+        prefill_prompt_tokens(composed_tokens);
     }
 
     ~ModelTokenIterator() {

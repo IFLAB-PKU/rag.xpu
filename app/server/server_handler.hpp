@@ -37,6 +37,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -753,14 +754,89 @@ inline BlockingPrefillResult run_blocking_prefill(
     };
 }
 
-inline ModelOutput run_blocking_decode_from_artifact(
-    const ModelInput &input, const powerserve::Tokenizer &tokenizer, BlockingPrefillResult &prefill_result
+inline BlockingPrefillResult run_blocking_prefill_segmented(
+    const ModelContext &context,
+    const ModelInput &input,
+    const std::vector<std::string> &input_segments,
+    powerserve::SamplerChain &sampler
+) {
+    using namespace powerserve;
+
+    if (input_segments.empty()) {
+        return run_blocking_prefill(context, input, input.m_prompt, sampler);
+    }
+
+    auto &config    = context.m_config;
+    auto &model     = *context.m_model_ptr;
+    auto &draft     = context.m_draft_model_ptr;
+    auto &tokenizer = *context.m_tokenizer_ptr;
+
+    const size_t max_num_token = input.m_max_num_token;
+    const size_t batch_size    = config.hyper_params.batch_size;
+
+    bool add_special_tokens = tokenizer.m_vocab.tokenizer_add_bos || tokenizer.m_vocab.tokenizer_add_eos;
+
+    Timer prefill_timer;
+    std::shared_ptr<powerserve::TokenIterator> iter = nullptr;
+
+    const std::string &first_segment = input_segments.front();
+    const std::vector<powerserve::Token> first_segment_tokens = tokenizer.tokenize(first_segment, add_special_tokens);
+    size_t num_prefill_token = first_segment_tokens.empty() ? 0 : first_segment_tokens.size() - 1;
+
+#if defined(POWERSERVE_WITH_QNN)
+    std::shared_ptr<powerserve::SpeculativeModel> spec_model = nullptr;
+    if (draft) {
+        spec_model = std::make_shared<powerserve::SpeculativeModel>(
+            context.m_model_ptr, context.m_draft_model_ptr, context.speculative_config
+        );
+        iter = spec_model->generate(tokenizer, sampler, first_segment, max_num_token, batch_size);
+    } else
+#endif
+    {
+        iter = model.generate(tokenizer, sampler, first_segment, max_num_token, batch_size);
+    }
+
+    auto segmented_iter = std::dynamic_pointer_cast<powerserve::ModelTokenIterator>(iter);
+    if (segmented_iter == nullptr) {
+        // Fallback for unsupported iterator implementations.
+        std::string merged_prompt;
+        for (const auto &segment : input_segments) {
+            merged_prompt += segment;
+        }
+        return run_blocking_prefill(context, input, merged_prompt, sampler);
+    }
+
+    for (size_t i = 1; i < input_segments.size(); ++i) {
+        const std::vector<powerserve::Token> segment_tokens = tokenizer.tokenize(input_segments[i], false);
+        if (segment_tokens.empty()) {
+            continue;
+        }
+        num_prefill_token += segment_tokens.size();
+        segmented_iter->prefill_segment_tokens(segment_tokens);
+        POWERSERVE_LOG_DEBUG(
+            "segmented prefill request_id={}, segment={}, tokens={}", input.request_id, i + 1, segment_tokens.size()
+        );
+    }
+
+    return {
+        .iter              = std::move(iter),
+        .num_prefill_token = num_prefill_token,
+        .prefill_time_ms   = static_cast<size_t>(prefill_timer.elapsed_time_ms())
+    };
+}
+
+inline ModelOutput run_blocking_decode_steps_from_artifact(
+    const ModelInput &input,
+    const powerserve::Tokenizer &tokenizer,
+    BlockingPrefillResult &prefill_result,
+    size_t max_decode_steps
 ) {
     using namespace powerserve;
 
     std::string output_text;
     std::string stop_reason = "length";
     size_t step             = 0;
+    size_t decode_steps     = 0;
     bool end_of_text        = false;
     double ttft_ms          = -1.0;
 
@@ -784,6 +860,11 @@ inline ModelOutput run_blocking_decode_from_artifact(
             continue;
         } // Avoid outputting the last token
 
+        if (decode_steps >= max_decode_steps) {
+            break;
+        }
+        decode_steps++;
+
         if (token == tokenizer.bos_token()) {
             continue;
         }
@@ -806,7 +887,6 @@ inline ModelOutput run_blocking_decode_from_artifact(
 
     const size_t decode_time_ms = decode_timer.elapsed_time_ms();
     const size_t total_time_ms  = prefill_result.prefill_time_ms + decode_time_ms;
-    const size_t decode_steps   = step > 1 ? step - 1 : 0;
     const double prefill_tps    = prefill_result.prefill_time_ms > 0
         ? prefill_result.num_prefill_token * 1000.0 / prefill_result.prefill_time_ms
         : 0.0;
@@ -834,6 +914,46 @@ inline ModelOutput run_blocking_decode_from_artifact(
         .m_output_num_token = step,
         .m_stop_reason      = stop_reason
     };
+}
+
+inline ModelOutput run_blocking_decode_from_artifact(
+    const ModelInput &input, const powerserve::Tokenizer &tokenizer, BlockingPrefillResult &prefill_result
+) {
+    return run_blocking_decode_steps_from_artifact(
+        input,
+        tokenizer,
+        prefill_result,
+        std::numeric_limits<size_t>::max()
+    );
+}
+
+inline ModelOutput blocking_inference_segmented_prefill_prototype(
+    const ModelContext &context,
+    const ModelInput &input,
+    const std::vector<std::string> &input_segments,
+    size_t max_decode_steps = 1
+) {
+    using namespace powerserve;
+
+    const auto &tokenizer = *context.m_tokenizer_ptr;
+
+    auto sampler_config           = context.m_config.hyper_params.sampler_config;
+    sampler_config.temperature    = input.m_temperature;
+    sampler_config.penalty_freq   = input.m_frequency_penalty;
+    sampler_config.penalty_present = input.m_presence_penalty;
+    sampler_config.penalty_repeat = input.m_repeat_penalty;
+    sampler_config.top_p          = input.m_top_p;
+    sampler_config.temperature    = input.m_temperature;
+    powerserve::SamplerChain sampler{sampler_config, tokenizer};
+
+    BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
+        context,
+        input,
+        input_segments,
+        sampler
+    );
+
+    return run_blocking_decode_steps_from_artifact(input, tokenizer, prefill_result, max_decode_steps);
 }
 
 struct PDOrchestratorTask {
