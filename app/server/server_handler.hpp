@@ -32,6 +32,7 @@
 
 #include <cstddef>
 #include <condition_variable>
+#include <chrono>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -127,14 +128,19 @@ struct ModelOutput {
     std::optional<std::string> m_stop_reason;
 };
 
-// Contract object for future P->D handoff. No behavior is wired yet.
+// Contract object for segmented prefill -> decode handoff.
 struct PrefillArtifact {
-    size_t request_id;
+    size_t request_id = 0;
     std::string model_id;
-    size_t num_prefill_tokens;
-    std::optional<powerserve::Token> last_prompt_token;
-    std::pair<size_t, size_t> kv_position_range;
-    std::optional<std::string> stop_reason;
+    size_t prefill_tokens_total = 0;
+    size_t kv_position_begin = 0;
+    size_t kv_position_end = 0;
+};
+
+struct SegmentedPrefillQueueDemoOutput {
+    ModelOutput output;
+    PrefillArtifact prefill_artifact;
+    size_t queue_wait_ms = 0;
 };
 
 using ServerSessionId = int;
@@ -716,6 +722,27 @@ struct BlockingPrefillResult {
     size_t prefill_time_ms;
 };
 
+inline PrefillArtifact build_prefill_artifact(
+    const ModelContext &context,
+    const ModelInput &input,
+    BlockingPrefillResult &prefill_result,
+    size_t kv_position_begin
+) {
+    POWERSERVE_ASSERT(context.m_model_ptr != nullptr);
+    POWERSERVE_ASSERT(context.m_model_ptr->m_platform != nullptr);
+
+    std::string model_id = context.m_model_ptr->m_config->model_id;
+    const size_t kv_position_end = context.m_model_ptr->m_platform->get_kv_position(model_id);
+
+    return {
+        .request_id = input.request_id,
+        .model_id = model_id,
+        .prefill_tokens_total = prefill_result.num_prefill_token,
+        .kv_position_begin = kv_position_begin,
+        .kv_position_end = kv_position_end,
+    };
+}
+
 inline BlockingPrefillResult run_blocking_prefill(
     const ModelContext &context, const ModelInput &input, const std::string &input_prompt, powerserve::SamplerChain &sampler
 ) {
@@ -954,6 +981,144 @@ inline ModelOutput blocking_inference_segmented_prefill_prototype(
     );
 
     return run_blocking_decode_steps_from_artifact(input, tokenizer, prefill_result, max_decode_steps);
+}
+
+inline std::shared_ptr<std::mutex> get_or_create_model_exec_mutex(const std::string &model_id);
+inline std::string get_model_exec_lock_key(const ModelContext &context);
+inline std::unique_lock<std::mutex> lock_model_execution(const ModelContext &context);
+
+class SequentialSegmentPrefillQueueDemo {
+public:
+    SequentialSegmentPrefillQueueDemo() {
+        m_worker = std::thread([this]() { worker_loop(); });
+    }
+
+    ~SequentialSegmentPrefillQueueDemo() {
+        {
+            std::lock_guard<std::mutex> lock_guard(m_lock);
+            m_shutdown = true;
+        }
+        m_cv.notify_all();
+        if (m_worker.joinable()) {
+            m_worker.join();
+        }
+    }
+
+    SegmentedPrefillQueueDemoOutput run(
+        const ModelContext &context,
+        const ModelInput &input,
+        const std::vector<std::string> &input_segments,
+        size_t max_decode_steps
+    ) {
+        SegmentedPrefillQueueTask task;
+        task.context = &context;
+        task.input = input;
+        task.input_segments = input_segments;
+        task.max_decode_steps = max_decode_steps;
+        task.enqueued_at = std::chrono::steady_clock::now();
+
+        auto result_future = task.result_promise.get_future();
+        {
+            std::lock_guard<std::mutex> lock_guard(m_lock);
+            m_queue.push_back(std::move(task));
+        }
+        m_cv.notify_one();
+        return result_future.get();
+    }
+
+private:
+    struct SegmentedPrefillQueueTask {
+        const ModelContext *context = nullptr;
+        ModelInput input;
+        std::vector<std::string> input_segments;
+        size_t max_decode_steps = 1;
+        std::chrono::steady_clock::time_point enqueued_at;
+        std::promise<SegmentedPrefillQueueDemoOutput> result_promise;
+    };
+
+    std::deque<SegmentedPrefillQueueTask> m_queue;
+    std::mutex m_lock;
+    std::condition_variable m_cv;
+    std::thread m_worker;
+    bool m_shutdown = false;
+
+    void worker_loop() {
+        while (true) {
+            SegmentedPrefillQueueTask task;
+            {
+                std::unique_lock<std::mutex> lock(m_lock);
+                m_cv.wait(lock, [this]() { return m_shutdown || !m_queue.empty(); });
+                if (m_shutdown && m_queue.empty()) {
+                    return;
+                }
+                task = std::move(m_queue.front());
+                m_queue.pop_front();
+            }
+
+            try {
+                POWERSERVE_ASSERT(task.context != nullptr);
+                const auto &context   = *task.context;
+                const auto &tokenizer = *context.m_tokenizer_ptr;
+                const auto &input = task.input;
+
+                const auto now = std::chrono::steady_clock::now();
+                const size_t queue_wait_ms = static_cast<size_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - task.enqueued_at).count()
+                );
+
+                auto model_exec_lock = lock_model_execution(context);
+
+                auto sampler_config           = context.m_config.hyper_params.sampler_config;
+                sampler_config.temperature    = input.m_temperature;
+                sampler_config.penalty_freq   = input.m_frequency_penalty;
+                sampler_config.penalty_present = input.m_presence_penalty;
+                sampler_config.penalty_repeat = input.m_repeat_penalty;
+                sampler_config.top_p          = input.m_top_p;
+                sampler_config.temperature    = input.m_temperature;
+                powerserve::SamplerChain sampler{sampler_config, tokenizer};
+
+                std::string model_id = context.m_model_ptr->m_config->model_id;
+                const size_t kv_position_begin = context.m_model_ptr->m_platform->get_kv_position(model_id);
+                BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
+                    context,
+                    input,
+                    task.input_segments,
+                    sampler
+                );
+                PrefillArtifact prefill_artifact = build_prefill_artifact(
+                    context,
+                    input,
+                    prefill_result,
+                    kv_position_begin
+                );
+
+                ModelOutput output = run_blocking_decode_steps_from_artifact(
+                    input,
+                    tokenizer,
+                    prefill_result,
+                    task.max_decode_steps
+                );
+
+                task.result_promise.set_value({
+                    .output = std::move(output),
+                    .prefill_artifact = std::move(prefill_artifact),
+                    .queue_wait_ms = queue_wait_ms,
+                });
+            } catch (...) {
+                task.result_promise.set_exception(std::current_exception());
+            }
+        }
+    }
+};
+
+inline SegmentedPrefillQueueDemoOutput blocking_inference_segmented_prefill_queue_demo(
+    const ModelContext &context,
+    const ModelInput &input,
+    const std::vector<std::string> &input_segments,
+    size_t max_decode_steps = 1
+) {
+    static SequentialSegmentPrefillQueueDemo queue_demo;
+    return queue_demo.run(context, input, input_segments, max_decode_steps);
 }
 
 struct PDOrchestratorTask {

@@ -69,6 +69,11 @@ struct RagResponse {
     std::string query_used;
     std::vector<std::string> sub_queries;
     bool generation_segmented_prefill_used = false;
+    bool generation_prefill_queue_demo_used = false;
+    size_t generation_prefill_queue_wait_ms = 0;
+    size_t generation_prefill_artifact_tokens = 0;
+    size_t generation_prefill_artifact_kv_begin = 0;
+    size_t generation_prefill_artifact_kv_end = 0;
     size_t generation_decode_steps_configured = 1;
     size_t generation_decode_steps = 0;
     std::vector<size_t> generation_segment_chars;
@@ -343,13 +348,13 @@ inline std::vector<std::string> build_generation_segments(
     segment_1 << "Question: " << query << "\n";
     segments.push_back(segment_1.str());
 
-    if (!sub_queries.empty()) {
-        std::ostringstream segment_2;
-        segment_2 << "Sub-query hints:\n";
-        for (const auto &sub_query : sub_queries) {
-            segment_2 << "- " << sub_query << "\n";
-        }
-        segments.push_back(segment_2.str());
+    // Keep each sub-query as an individual segment so queue scheduling granularity
+    // matches sub-query units instead of one merged hint block.
+    for (const auto &sub_query : sub_queries) {
+        std::ostringstream segment_2_item;
+        segment_2_item << "Sub-query hint:\n";
+        segment_2_item << "- " << sub_query << "\n";
+        segments.push_back(segment_2_item.str());
     }
 
     std::ostringstream segment_3;
@@ -542,13 +547,18 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     try {
         ModelInput generation_input = make_generation_input(request, generation_segments.front());
         const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
-        auto generation_model_lock = lock_model_execution(generation_context);
-        generation_out = blocking_inference_segmented_prefill_prototype(
+        SegmentedPrefillQueueDemoOutput queue_demo_output = blocking_inference_segmented_prefill_queue_demo(
             generation_context,
             generation_input,
             generation_segments,
             request.generation_decode_steps
         );
+        generation_out = std::move(queue_demo_output.output);
+        response.generation_prefill_queue_demo_used = true;
+        response.generation_prefill_queue_wait_ms = queue_demo_output.queue_wait_ms;
+        response.generation_prefill_artifact_tokens = queue_demo_output.prefill_artifact.prefill_tokens_total;
+        response.generation_prefill_artifact_kv_begin = queue_demo_output.prefill_artifact.kv_position_begin;
+        response.generation_prefill_artifact_kv_end = queue_demo_output.prefill_artifact.kv_position_end;
         segmented_prefill_used = true;
     } catch (...) {
         const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
