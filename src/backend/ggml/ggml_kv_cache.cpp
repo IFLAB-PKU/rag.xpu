@@ -16,7 +16,65 @@
 
 #include "backend/cpu_buffer.hpp"
 
+#include <sys/mman.h>
+
 namespace powerserve::ggml {
+
+MappedFloatBuffer::~MappedFloatBuffer() {
+    release();
+}
+
+MappedFloatBuffer::MappedFloatBuffer(MappedFloatBuffer &&other) noexcept {
+    move_from(std::move(other));
+}
+
+auto MappedFloatBuffer::operator=(MappedFloatBuffer &&other) noexcept -> MappedFloatBuffer & {
+    if (this != &other) {
+        release();
+        move_from(std::move(other));
+    }
+    return *this;
+}
+
+bool MappedFloatBuffer::allocate(size_t n_floats) {
+    release();
+    if (n_floats == 0) {
+        return true;
+    }
+
+    m_size = n_floats;
+    m_bytes = n_floats * sizeof(float);
+    void *mapped = mmap(nullptr, m_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        m_data = nullptr;
+        m_size = 0;
+        m_bytes = 0;
+        return false;
+    }
+
+    m_data = static_cast<float *>(mapped);
+    zero_fill();
+    return true;
+}
+
+void MappedFloatBuffer::release() {
+    if (m_data != nullptr) {
+        const int rc = munmap(m_data, m_bytes);
+        POWERSERVE_ASSERT(rc == 0, "munmap failed for mapped float buffer");
+    }
+    m_data = nullptr;
+    m_size = 0;
+    m_bytes = 0;
+}
+
+void MappedFloatBuffer::move_from(MappedFloatBuffer &&other) noexcept {
+    m_data = other.m_data;
+    m_size = other.m_size;
+    m_bytes = other.m_bytes;
+    other.m_data = nullptr;
+    other.m_size = 0;
+    other.m_bytes = 0;
+}
 
 GGMLKV::GGMLKV(const ModelConfig::LLMConfig &config) :
     m_kv_dim(config.kv_dim),
@@ -39,22 +97,24 @@ void GGMLKV::prepare_model_chunk() {
 
     key_buffer.resize(m_n_layers);
     value_buffer.resize(m_n_layers);
+    chunk.key_tensors.clear();
+    chunk.value_tensors.clear();
+    chunk.key_tensors.reserve(m_n_layers);
+    chunk.value_tensors.reserve(m_n_layers);
     size_t layer_size = m_kv_dim * m_n_ctx;
     for (size_t layer_id = 0; layer_id < m_n_layers; layer_id++) {
-        key_buffer[layer_id].resize(layer_size);
-        value_buffer[layer_id].resize(layer_size);
+        POWERSERVE_ASSERT(key_buffer[layer_id].allocate(layer_size), "failed to mmap key buffer for layer {}", layer_id);
+        POWERSERVE_ASSERT(
+            value_buffer[layer_id].allocate(layer_size),
+            "failed to mmap value buffer for layer {}",
+            layer_id
+        );
 
         chunk.key_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
         chunk.value_tensors.emplace_back(Tensor(DataType::FP32, {m_n_ctx, m_kv_dim, 1, 1}));
-        Stride stride = {
-            sizeof(float),
-            sizeof(float) * m_n_ctx,
-            sizeof(float) * m_kv_dim * m_n_ctx,
-            sizeof(float) * m_kv_dim * m_n_ctx
-        };
-        chunk.key_tensors[layer_id].m_data   = std::make_shared<CPUBuffer>(stride, key_buffer[layer_id].data());
-        chunk.value_tensors[layer_id].m_data = std::make_shared<CPUBuffer>(stride, value_buffer[layer_id].data());
     }
+    bind_full_kv_tensors();
+    m_full_kv_allocated = true;
 
     k.resize(m_n_layers);
     v.resize(m_n_layers);
@@ -65,6 +125,53 @@ void GGMLKV::prepare_model_chunk() {
 
     auto &attn_bias = chunk.attn_bias;
     attn_bias.resize(m_batch_size * m_n_ctx);
+}
+
+void GGMLKV::bind_full_kv_tensors() {
+    Stride stride = {
+        sizeof(float),
+        sizeof(float) * m_n_ctx,
+        sizeof(float) * m_kv_dim * m_n_ctx,
+        sizeof(float) * m_kv_dim * m_n_ctx
+    };
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        chunk.key_tensors[layer_id].m_data   = std::make_shared<CPUBuffer>(stride, chunk.key_buffer[layer_id].data());
+        chunk.value_tensors[layer_id].m_data = std::make_shared<CPUBuffer>(stride, chunk.value_buffer[layer_id].data());
+    }
+}
+
+void GGMLKV::ensure_full_kv_storage() {
+    if (m_full_kv_allocated) {
+        return;
+    }
+    const size_t layer_size = m_kv_dim * m_n_ctx;
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        POWERSERVE_ASSERT(
+            chunk.key_buffer[layer_id].allocate(layer_size),
+            "failed to mmap key buffer for layer {}",
+            layer_id
+        );
+        POWERSERVE_ASSERT(
+            chunk.value_buffer[layer_id].allocate(layer_size),
+            "failed to mmap value buffer for layer {}",
+            layer_id
+        );
+    }
+    bind_full_kv_tensors();
+    m_full_kv_allocated = true;
+}
+
+void GGMLKV::release_full_kv_storage() {
+    if (!m_full_kv_allocated) {
+        return;
+    }
+    for (size_t layer_id = 0; layer_id < m_n_layers; ++layer_id) {
+        chunk.key_tensors[layer_id].m_data.reset();
+        chunk.value_tensors[layer_id].m_data.reset();
+        chunk.key_buffer[layer_id].release();
+        chunk.value_buffer[layer_id].release();
+    }
+    m_full_kv_allocated = false;
 }
 
 } // namespace powerserve::ggml
