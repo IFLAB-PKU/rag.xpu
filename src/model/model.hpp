@@ -39,6 +39,24 @@ struct LogitsVector {
     }
 };
 
+// [NEW], in fact a renamed version of LogitsVector
+struct EmbeddingVector {
+    BufferPtr buffer;
+    std::vector<std::span<const float>> embeddings;
+
+    EmbeddingVector() = default;
+
+    // dim: embedding_dim
+    // batch_size: current_bs
+    EmbeddingVector(BufferPtr buffer, size_t dim, size_t batch_size) : buffer(buffer) {
+        float *data_ptr = static_cast<float *>(dynamic_cast<CPUBuffer &>(*buffer).m_data);
+        for (size_t i = 0; i < batch_size; i++) {
+            embeddings.push_back(std::span<const float>(data_ptr, data_ptr + dim));
+            data_ptr += dim;
+        }
+    }
+};
+
 struct TokenIterator {
     size_t n_rest              = 0;
     std::string m_prompt       = "";
@@ -104,6 +122,24 @@ public:
         bool lm_head = true
     ) -> LogitsVector = 0;
 
+    virtual auto compute_embedding(const std::vector<Token> &tokens, size_t batch_size) // supported by Qwen3-Embedding
+    -> std::vector<float> {
+        (void)tokens;     // unused
+        (void)batch_size; // unused
+        POWERSERVE_LOG_ERROR("compute_embedding is not implemented for this model.");
+        throw std::runtime_error("Embedding not supported");
+        return {};
+    };
+
+    virtual auto compute_rerank_score(const std::vector<Token> &tokens, size_t batch_size) 
+    -> float {
+        (void)tokens; // unused
+        (void)batch_size; // unused
+        POWERSERVE_LOG_ERROR("compute_rerank_score is not implemented for this model.");
+        throw std::runtime_error("Rerank not supported");
+        return 0.0f;
+    };
+
 public:
     virtual auto decode(Sampler &sampler, const std::vector<Token> tokens, const std::vector<int> pos, bool lm_head)
         -> std::vector<Token> = 0;
@@ -133,7 +169,9 @@ public:
             return;
         }
 
-        auto prompt_tokens   = m_tokenizer.tokenize(m_prompt, m_tokenizer.m_vocab.tokenizer_add_bos);
+        bool add_special_tokens = m_tokenizer.m_vocab.tokenizer_add_bos || m_tokenizer.m_vocab.tokenizer_add_eos;
+        auto prompt_tokens   = m_tokenizer.tokenize(m_prompt, add_special_tokens);
+        POWERSERVE_LOG_DEBUG("Prompt tokens: {}", prompt_tokens);
         auto n_prompt_tokens = prompt_tokens.size();
         size_t n_prefilled   = 0;
         size_t position      = 0;

@@ -47,6 +47,14 @@ public:
         const CausalAttentionMask &mask,
         bool lm_head = true
     ) -> LogitsVector override;
+
+    // lsh add for Qwen3-Embedding 
+    auto compute_embedding(const std::vector<Token> &tokens, size_t batch_size) 
+        -> std::vector<float> override;
+
+    // lsh add for Qwen3-Rerank
+    auto compute_rerank_score(const std::vector<Token> &tokens, size_t batch_size) 
+    -> float override;
 };
 
 } // namespace powerserve

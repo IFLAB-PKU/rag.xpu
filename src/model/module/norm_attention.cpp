@@ -36,8 +36,8 @@ TensorNode *NormAttention::build(
     auto batch_size = pos.size();
     auto head_size  = m_config.head_size;
 
-    // POWERSERVE_ASSERT(head_size == (size_t)m_config.rope_config.n_dims);
-    // 不要 assert 这个啦！Qwen3 跑不动的！
+    POWERSERVE_ASSERT(head_size == (size_t)m_config.rope_config.n_dims);
+    // 要 assert 这个，Qwen3的head_size、rope_config.n_dims都变成128了
     
     auto n_head    = m_config.n_heads;
     auto n_head_kv = m_config.n_kv_heads;

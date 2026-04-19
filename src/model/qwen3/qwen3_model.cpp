@@ -87,10 +87,9 @@ auto Qwen3Model::forward(
             for (size_t L = 0; L < llm_config.n_layers; L++) {
                 auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
                 /* lsh 修改起始 */
-                // qwen3不需要使用bias
-                bool is_need_bias = (m_config->arch == "qwen3") ? false : true;
+                bool is_need_bias = false;
                 /* lsh 修改结束 */
-                auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, is_need_bias); //原先最后一个参数硬编码为True，强制要求使用bias
+                auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, is_need_bias); //Qwen2最后一个参数硬编码为True，要求使用bias
                 auto ffn_o = m_ffn->build(g, att_o, L);
                 x          = ffn_o;
             }
@@ -141,6 +140,229 @@ auto Qwen3Model::generate(
     const Tokenizer &tokenizer, Sampler &sampler, const std::string &prompt, int steps, size_t batch_size
 ) -> std::shared_ptr<TokenIterator> {
     return std::make_shared<ModelTokenIterator>(*this, tokenizer, sampler, prompt, steps, batch_size);
+}
+
+// `compute_embedding` does not interact with ModelIterator, so it prepares its environment, say `m_platform` and `pos`, in itself.
+auto Qwen3Model::compute_embedding(const std::vector<Token> &tokens, size_t batch_size)
+    -> std::vector<float> {
+    auto &llm_config = m_config->llm;
+    size_t n_tokens  = tokens.size();
+
+    // Set up platform
+    m_platform->reset_kv_position(m_config->model_id);
+    m_platform->ggml_backends[m_config->model_id]->setup_threadpool();
+
+    size_t n_processed = 0;
+
+    // Loop processing tokens in batches. 
+    while(n_processed < n_tokens) {
+        size_t current_bs = std::min(batch_size, n_tokens - n_processed);
+        std::vector<int> batch_tokens(tokens.begin() + n_processed, tokens.begin() + n_processed + current_bs);
+
+        int start_pos = m_platform->get_kv_position(m_config->model_id);
+        std::vector<int> batch_pos(current_bs);
+        std::iota(batch_pos.begin(), batch_pos.end(), start_pos);
+
+        auto mask = CausalAttentionMask(current_bs);
+        bool is_last_batch = (n_processed + current_bs == n_tokens); // identify last token
+
+        // build graph
+        Graph g(m_config->model_id);
+        // input embedding
+        auto embd_tb = g.add_tensor(m_weights->token_embedding_table);
+        auto x       = g.get_embedding(embd_tb, batch_tokens);
+
+#if defined(POWERSERVE_WITH_QNN)
+        if (m_platform->qnn_backend) {
+            auto size = llm_config.dim;
+            x=g.qnn_forward(x, batch_pos, mask, size, true /* lm_head=false */); 
+            // [NOTE]: `lm_head=true` in order to satisfy qnn_forward's output size. Indeed we do not use lm_head.bin to compute logits. We want hidden states.
+
+                
+            if (is_last_batch) {
+                auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
+                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+                x                   = final_rms_norm;
+            }
+        } else
+#endif
+        if(!lazy_load){
+            m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(current_bs); // use REAL batch size
+            for (size_t L = 0; L < llm_config.n_layers; L++) {
+                auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+                bool is_need_bias = false;
+                auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), batch_pos, mask, is_need_bias);
+                auto ffn_o = m_ffn->build(g, att_o, L);
+                x          = ffn_o;
+            }
+            
+            if(is_last_batch) { // Qwen3-Embedding uses "last token pooling"
+                auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
+                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+                x                   = final_rms_norm;
+            }
+        }
+
+        // Execute the graph
+        Executor executor(*m_platform, g);
+        executor.allocate_buffers();
+        executor.run();
+
+    #if defined(POWERSERVE_WITH_QNN)
+        if (!m_platform->qnn_backend)
+    #endif
+        {
+            m_platform->ggml_backends[m_config->model_id]->m_kv->advance(current_bs);
+        }
+
+        if (is_last_batch){
+            const size_t dim = llm_config.dim; //embd_dim, see src/core/config.cpp
+            EmbeddingVector view(x->m_data, dim, current_bs);
+            auto last_token_span = view.embeddings.back();
+
+            std::vector<float> embedding(dim);
+            float norm_sq = 0.0f;
+
+            for (size_t i = 0; i < dim; ++i) {
+                float val = last_token_span[i];
+                embedding[i] = val;
+                norm_sq += val * val;
+            }
+
+            // L2 Norm
+            float norm = std::sqrt(norm_sq);
+            const float eps = 1e-12f;
+            if (norm > eps) {
+                for (size_t i = 0; i < dim; ++i) {
+                    embedding[i] /= norm;
+                }
+            }
+            
+            // clean thread pool, see ~ModelTokenIterator() in src/model/model.hpp
+            m_platform->ggml_backends[m_config->model_id]->reset_threadpool();
+            
+            return embedding;
+        }
+        n_processed += current_bs;
+    }
+    return {}; //should not reach here
+} 
+
+auto Qwen3Model::compute_rerank_score(const std::vector<Token> &tokens, size_t batch_size) -> float {
+    auto &llm_config = m_config->llm;
+    size_t n_tokens  = tokens.size();
+
+    // 1. Setup Environment
+    m_platform->reset_kv_position(m_config->model_id);
+    m_platform->ggml_backends[m_config->model_id]->setup_threadpool();
+
+    size_t n_processed = 0;
+
+    // 2. Loop processing tokens in batches (Mimics compute_embedding)
+    while (n_processed < n_tokens) {
+        size_t current_bs = std::min(batch_size, n_tokens - n_processed);
+        std::vector<int> batch_tokens(tokens.begin() + n_processed, tokens.begin() + n_processed + current_bs);
+
+        int start_pos = m_platform->get_kv_position(m_config->model_id);
+        std::vector<int> batch_pos(current_bs);
+        std::iota(batch_pos.begin(), batch_pos.end(), start_pos);
+
+        auto mask = CausalAttentionMask(current_bs);
+        bool is_last_batch = (n_processed + current_bs == n_tokens);
+
+        // 3. Build Graph
+        Graph g(m_config->model_id);
+        auto embd_tb = g.add_tensor(m_weights->token_embedding_table);
+        auto x       = g.get_embedding(embd_tb, batch_tokens);
+
+#if defined(POWERSERVE_WITH_QNN)
+        if (m_platform->qnn_backend) {
+            // NPU Backbone: Use QNN to calculate hidden states
+            // This corresponds to your qwen3_reranker_0.6b_x.bin binaries
+            auto size = llm_config.dim;
+            x = g.qnn_forward(x, batch_pos, mask, size, true /* lm_head=true */);
+            // [NOTE]: `lm_head=true` in order to satisfy qnn_forward's output size. Indeed we do not use lm_head.bin to compute logits. We want hidden states.
+
+            // CPU Tail: Manually attach the Rerank Head logic
+            // We intentionally ignore the QNN's lm_head.bin
+            // and use the precise valid metrics from GGUF (cls.output.weight 2x1024)
+            if (is_last_batch) {
+                // 1. Final RMS Norm (CPU)
+                auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
+                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+                
+                // 2. Output Projection to [Batch, 2] (CPU)
+                auto output_w       = g.add_tensor(m_weights->output_weight);
+                x                   = g.mat_mul(output_w, final_rms_norm);
+                
+                // 3. Softmax (CPU)
+                x                   = g.softmax(x);
+            }
+        } else
+#endif
+        if (!lazy_load) {
+            m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(current_bs);
+            for (size_t L = 0; L < llm_config.n_layers; L++) {
+                auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+                bool is_need_bias = false;
+                auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), batch_pos, mask, is_need_bias);
+                auto ffn_o = m_ffn->build(g, att_o, L);
+                x          = ffn_o;
+            }
+
+            // --- Last Batch Logic: Final Norm + Head + Softmax ---
+            if (is_last_batch) {
+                // 1. RMS Norm
+                auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
+                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+                
+                // 2. Output Projection (to logits [batch, 2])
+                auto output_w       = g.add_tensor(m_weights->output_weight);
+                x                   = g.mat_mul(output_w, final_rms_norm);
+                
+                // 3. Softmax (In-Graph)
+                x                   = g.softmax(x);
+            }
+        }
+
+        // 4. Execution
+        Executor executor(*m_platform, g);
+        executor.allocate_buffers();
+        POWERSERVE_LOG_INFO("Rerank: Executing batch of size {}", current_bs);
+        executor.run();
+        POWERSERVE_LOG_INFO("Rerank: Execution complete for batch size {}", current_bs);
+
+#if defined(POWERSERVE_WITH_QNN)
+        if (!m_platform->qnn_backend)
+#endif
+        {
+            m_platform->ggml_backends[m_config->model_id]->m_kv->advance(current_bs);
+        }
+
+        // 5. Extract Result (Only if last batch)
+        if (is_last_batch) {
+            // x->m_data now contains probabilities [batch, 2]
+            // We need the result for the very last token
+            size_t valid_token_idx = current_bs - 1;
+            // Assuming output dimension is 2 (Yes/No)
+            // Safety: ensure dimension logic is sound. GGUF dump says 2.
+            size_t dim = x->m_shape[0]; 
+            if (dim != 2) {
+                POWERSERVE_LOG_ERROR("Rerank output dimension mismatch, expected 2 but got {}", dim);
+                POWERSERVE_ASSERT(false, "Qwen3-Reranker expect 2 for output dimension.");
+            } // Qwen3-Reranker output dim is 2
+            float* probs = static_cast<float*>(dynamic_cast<CPUBuffer&>(*x->m_data).m_data);
+            float score = probs[valid_token_idx * dim + 0]; // Index 0 is 'yes'
+
+            m_platform->ggml_backends[m_config->model_id]->reset_threadpool();
+
+            return score;
+        }
+
+        n_processed += current_bs;
+    }
+
+    return 0.0f; // Should not reach here
 }
 
 } // namespace powerserve

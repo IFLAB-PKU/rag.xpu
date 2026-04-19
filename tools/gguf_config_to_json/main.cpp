@@ -63,6 +63,8 @@ rope_type get_rope_type(std::string arch) {
         return rope_type::NORMAL;
     } else if (arch == "qwen" || arch == "phi3") {
         return rope_type::NEOX;
+    } else if (arch == "qwen2" || arch == "qwen3") { // lsh added
+        return rope_type::NEOX;
     }
     return rope_type::NONE;
 }
@@ -104,6 +106,22 @@ void collect_config(gguf_context *ctx, nlohmann::json &config) {
     config["model_arch"]   = model_arch;
     auto get_arch_config([&model_arch](const std::string &c) { return fmt::format(fmt::runtime(c), model_arch); });
 
+    // [NEW] Check for reranker flag
+    std::string model_name = get_str(ctx, "general.name", false, "");
+    if (model_name.find("Rerank") != std::string::npos) {
+        config["is_reranker"] = true;
+    } else {
+        config["is_reranker"] = false;
+    }
+
+    // [NEW] Check for embedding flag
+    if (model_name.find("Embedding") != std::string::npos) {
+        config["is_embedding"] = true;
+    } else {
+        config["is_embedding"] = false;
+    }
+    
+
     { // embed_dim, ffn_dim, n_heads, n_kv_heads, n_layers, n_ctx
         config["embed_dim"]       = get_u32(ctx, get_arch_config("{}.embedding_length"));
         config["ffn_dim"]         = get_u32(ctx, get_arch_config("{}.feed_forward_length"));
@@ -112,6 +130,10 @@ void collect_config(gguf_context *ctx, nlohmann::json &config) {
         config["n_layers"]        = get_u32(ctx, get_arch_config("{}.block_count"));
         config["n_ctx"]           = get_u32(ctx, get_arch_config("{}.context_length"));
         config["head_size"]       = (uint32_t)config["embed_dim"] / (uint32_t)config["n_attn_heads"];
+        // [FIX] read `key_length` as head_dim if exists
+        auto key_length_idx = gguf_find_key(ctx, get_arch_config("{}.attention.key_length").c_str());
+        if (key_length_idx != -1) config["head_size"] = gguf_get_val_u32(ctx, key_length_idx);
+
         config["kv_dim"]          = (uint32_t)config["head_size"] * (uint32_t)config["n_attn_kv_heads"];
     }
     { // vocab_size

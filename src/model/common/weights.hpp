@@ -59,7 +59,7 @@ protected:
 struct Weight {
 public:
     Tensor token_embedding_table; // "token_embd.weight" (vocab_size, dim)
-    Tensor output_weight;         // "output.weight" (vocab_size, dim)
+    Tensor output_weight;         // "output.weight" (vocab_size, dim) OR "cls.output.weight"
     Tensor rms_final_weight;      // "output_norm.weight" (dim,)
 
     std::vector<LayerWeights> lw;
@@ -68,7 +68,14 @@ public:
     Weight(ggml_context *ctx, bool lazy_load) {
         token_embedding_table = ggml::convert_from_ggml(ggml_get_tensor(ctx, "token_embd.weight"));
         if (!lazy_load) {
-            auto ow_name     = ggml_get_tensor(ctx, "output.weight") == nullptr ? "token_embd.weight" : "output.weight";
+            const char* ow_name = nullptr;
+            if (ggml_get_tensor(ctx, "cls.output.weight") != nullptr) { // reranker head
+                ow_name = "cls.output.weight";
+            } else if (ggml_get_tensor(ctx, "output.weight") != nullptr) {
+                ow_name = "output.weight";
+            } else {
+                ow_name = "token_embd.weight";
+            }
             output_weight    = ggml::convert_from_ggml(ggml_get_tensor(ctx, ow_name));
             rms_final_weight = ggml::convert_from_ggml(ggml_get_tensor(ctx, "output_norm.weight"));
         }

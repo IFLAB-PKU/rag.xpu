@@ -159,6 +159,52 @@ inline ModelInput parse_chat_model_input(const nlohmann::json &request) {
     return input;
 }
 
+/*!
+ * @brief Parse message for embedding request
+ * @ref https://platform.openai.com/docs/api-reference/embeddings/create
+ */
+inline ModelInput parse_embedding_model_input(const nlohmann::json &request) {
+    static size_t request_counter = 0;
+
+    ModelInput input{
+        .m_model    = request["model"],
+        .m_prompt   = request["input"], // Embedding API uses "input" for the text
+        .request_id = request_counter++
+    };
+    return input;
+}
+
+/*!
+ * @brief Parse message for rerank request
+ * @ref https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+ * @ref https://jina.ai/reranker/
+ */
+inline ModelInput parse_rerank_model_input(const nlohmann::json &request) {
+    static size_t request_counter = 0;
+
+    ModelInput input{
+        .m_model    = request["model"],
+        .m_prompt   = request["query"], 
+        .request_id = request_counter++
+    };
+    
+    // Extract documents
+    if (request.contains("documents")) {
+        // nlohmann::json supports direct conversion to std::vector<std::string>
+        input.m_documents = request["documents"].get<std::vector<std::string>>();
+    } else {
+        // Valid rerank request must have documents. 
+        // We can throw here to trigger response_error in handler, or let logic handle it later.
+        throw std::invalid_argument("'documents' field is required");
+    }
+    
+    // Extract top_n, default to return all if not specified
+    // Using a large number to represent "all" if not provided
+    input.m_top_n = request.value("top_n", std::numeric_limits<size_t>::max());
+   
+    return input;
+}
+
 inline nlohmann::json dump_completion_response(const ModelInput &input, const ModelOutput &output) {
     const auto choices = std::vector<nlohmann::json>{
         {{"text", output.m_text}, {"index", 0}, {"logprobs", nullptr}, {"finish_reason", "stop"}}
@@ -241,6 +287,44 @@ inline nlohmann::json dump_chat_response(const ModelInput &input, const ModelOut
     }
     // chat completion
     return dump_chat_completion_response(input, output);
+}
+
+inline nlohmann::json dump_embedding_response(const ModelInput &input, const ModelOutput &output) {
+    const auto data = std::vector<nlohmann::json>{
+        {{"object", "embedding"},
+         {"embedding", output.m_embedding},
+         {"index", 0}}
+    };
+
+    return {
+        {"object", "list"},
+        {"data", data},
+        {"model", input.m_model},
+        {"usage",
+         {{"prompt_tokens", output.m_input_num_token},
+          {"total_tokens", output.m_input_num_token}}}
+    };
+}
+
+inline nlohmann::json dump_rerank_response(const ModelInput &input, const ModelOutput &output) {
+    std::vector<nlohmann::json> results;
+    results.reserve(output.m_rerank_results.size());
+
+    for (const auto& item : output.m_rerank_results) {
+        results.push_back({
+            {"index", item.index},
+            {"relevance_score", item.score}
+        });
+    }
+
+    return {
+        {"model", input.m_model},
+        {"object", "list"},
+        {"usage",
+         {{"prompt_tokens", output.m_input_num_token},
+          {"total_tokens", output.m_input_num_token}}}, 
+        {"results", results}
+    };
 }
 
 inline nlohmann::json dump_model_response(const std::vector<std::string> models) {
@@ -423,6 +507,75 @@ inline void handler_chat(ServerContext &server_context, const T_Request &request
         }
 
         POWERSERVE_LOG_INFO("after chat: {}", powerserve::perf_get_mem_result());
+    } catch (const std::invalid_argument &err) {
+        response_error(err.what(), ErrorType::InvalidRequest, response);
+    } catch (const std::exception &err) {
+        response_error(err.what(), ErrorType::Server, response);
+    } catch (...) {
+        response_error("unknown error", ErrorType::Server, response);
+    }
+}
+
+template <class T_Request = httplib::Request, class T_Response = httplib::Response>
+inline void handler_embedding(ServerContext &server_context, const T_Request &request, T_Response &response) {
+    POWERSERVE_LOG_INFO("process embedding task");
+    /* Parse received message */
+    ModelInput model_input;
+    try {
+        const auto body = nlohmann::json::parse(request.body);
+        /* Set input */
+        model_input = parse_embedding_model_input(body);
+    } catch (const std::exception &err) {
+        response_error(err.what(), ErrorType::InvalidRequest, response);
+        return;
+    } catch (...) {
+        response_error("unknown error", ErrorType::Server, response);
+        return;
+    }
+
+    try {
+        /* Inference */
+        const ModelOutput model_output = embedding(server_context, model_input);
+
+        /* Send result */
+        response_normal(dump_embedding_response(model_input, model_output), response);
+
+        POWERSERVE_LOG_INFO("after embedding: {}", powerserve::perf_get_mem_result());
+    } catch (const std::invalid_argument &err) {
+        response_error(err.what(), ErrorType::InvalidRequest, response);
+    } catch (const std::exception &err) {
+        response_error(err.what(), ErrorType::Server, response);
+    } catch (...) {
+        response_error("unknown error", ErrorType::Server, response);
+    }
+}
+
+template <class T_Request = httplib::Request, class T_Response = httplib::Response>
+inline void handler_rerank(ServerContext &server_context, const T_Request &request, T_Response &response) {
+    POWERSERVE_LOG_INFO("process rerank task");
+    /* Parse received message */
+    ModelInput model_input;
+    try {
+        const auto body = nlohmann::json::parse(request.body);
+        /* Set input */
+        model_input = parse_rerank_model_input(body);
+    } catch (const std::exception &err) {
+        response_error(err.what(), ErrorType::InvalidRequest, response);
+        return;
+    } catch (...) {
+        response_error("unknown error", ErrorType::Server, response);
+        return;
+    }
+
+    try {
+        /* Inference */
+        // 需要在 server_context 中实现 rerank 方法
+        const ModelOutput model_output = rerank(server_context, model_input);
+
+        /* Send result */
+        response_normal(dump_rerank_response(model_input, model_output), response);
+
+        POWERSERVE_LOG_INFO("after rerank: {}", powerserve::perf_get_mem_result());
     } catch (const std::invalid_argument &err) {
         response_error(err.what(), ErrorType::InvalidRequest, response);
     } catch (const std::exception &err) {
