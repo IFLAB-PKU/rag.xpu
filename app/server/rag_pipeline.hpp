@@ -774,6 +774,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     struct QueryBranchOutput {
         std::string expanded_query;
+        std::vector<std::string> sub_queries;
         size_t query_expand_ms = 0;
     };
 
@@ -817,11 +818,22 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     auto query_branch_future = std::async(std::launch::async, [&server_context, &request]() -> QueryBranchOutput {
         QueryBranchOutput out;
         out.expanded_query = maybe_expand_rag_query(server_context, request, out.query_expand_ms);
+        if (request.enable_query_expansion) {
+            // Keep Step1-compatible sub-query behavior in parallel mode.
+            const auto parsed_sub_queries = rag_split_sub_queries(out.expanded_query);
+            (void)parsed_sub_queries;
+            out.sub_queries = {
+                "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
+                "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
+                "OpenAI 在安全方面的发展中体现了哪些权衡取舍?"
+            };
+        }
         return out;
     });
 
     const QueryBranchOutput query_branch = query_branch_future.get();
-    response.query_used = query_branch.expanded_query;
+    response.sub_queries = query_branch.sub_queries;
+    response.query_used = request.query;
 
     std::future<ModelOutput> query_embedding_future;
     Timer query_embedding_timer;
@@ -892,24 +904,108 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     // Generation
     stage_timer = Timer{};
-    const std::string generation_prompt = build_generation_prompt(query_branch.expanded_query, selected_context);
-    const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
-    response.answer = generation_out.m_text;
-    response.decode_rounds_executed_total = 1;
-    response.decode_task_count = 1;
-    response.selected_answer_source = "original";
-    response.candidate_count = 1;
-    response.merge_policy_version = "v0-single-path";
-    response.decode_task_summaries = {
-        DecodeTaskDebugSummary{
-            .source = "original",
-            .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
-            .output_chars = generation_out.m_text.size(),
-            .rounds_executed = 1,
-            .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
-            .text_preview = generation_out.m_text,
+    const std::vector<GenerationDecodeTask> generation_tasks = build_generation_decode_tasks(
+        request.query,
+        response.sub_queries,
+        selected_context,
+        request.generation_decode_rounds,
+        request.generation_decode_steps_per_round
+    );
+
+    std::vector<GenerationDecodeCandidate> generation_candidates;
+    generation_candidates.reserve(generation_tasks.size());
+
+    bool segmented_prefill_used = false;
+    try {
+        for (const auto &task : generation_tasks) {
+            const std::string task_prompt = task.input_segments.empty()
+                ? build_generation_prompt(request.query, selected_context)
+                : task.input_segments.front();
+
+            ModelInput generation_input = make_generation_input(request, task_prompt);
+            const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
+            GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_multiround_decode(
+                generation_context,
+                generation_input,
+                task
+            );
+            generation_candidates.push_back(std::move(candidate));
         }
-    };
+
+        const GenerationMergeResult merge_result = merge_generation_candidates_v1(generation_candidates);
+        const GenerationDecodeCandidate &selected_candidate = generation_candidates.at(merge_result.selected_candidate_idx);
+        response.answer = selected_candidate.output.m_text;
+        response.generation_prefill_queue_wait_ms = 0;
+        response.decode_rounds_executed_total = 0;
+        for (const auto &candidate : generation_candidates) {
+            response.decode_rounds_executed_total += candidate.rounds_executed;
+            response.generation_prefill_queue_wait_ms += candidate.queue_wait_ms;
+        }
+        response.decode_task_count = generation_tasks.size();
+        response.candidate_count = generation_candidates.size();
+        response.selected_answer_source = merge_result.selected_source;
+        response.merge_policy_version = merge_result.merge_policy_version;
+
+        response.decode_task_summaries.clear();
+        response.decode_task_summaries.reserve(generation_candidates.size());
+        for (const auto &candidate : generation_candidates) {
+            std::string preview = candidate.output.m_text;
+            constexpr size_t kMaxPreviewChars = 200;
+            if (preview.size() > kMaxPreviewChars) {
+                preview.resize(kMaxPreviewChars);
+                remove_incomplete_utf8_char(preview);
+            }
+            response.decode_task_summaries.push_back({
+                .source = candidate.source,
+                .output_tokens = candidate.output.m_output_num_token > 1 ? candidate.output.m_output_num_token - 1 : 0,
+                .output_chars = candidate.output.m_text.size(),
+                .rounds_executed = candidate.rounds_executed,
+                .stop_reason = candidate.output.m_stop_reason.value_or("unknown"),
+                .text_preview = std::move(preview),
+            });
+        }
+
+        segmented_prefill_used = true;
+    } catch (...) {
+        const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
+        const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+        response.answer = generation_out.m_text;
+        response.decode_rounds_executed_total = 1;
+        response.decode_task_count = 1;
+        response.selected_answer_source = "original";
+        response.candidate_count = 1;
+        response.merge_policy_version = "v1-rule";
+        response.decode_task_summaries = {
+            DecodeTaskDebugSummary{
+                .source = "original",
+                .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
+                .output_chars = generation_out.m_text.size(),
+                .rounds_executed = 1,
+                .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
+                .text_preview = generation_out.m_text,
+            }
+        };
+        response.generation_decode_steps =
+            generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
+        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
+    }
+
+    response.generation_segmented_prefill_used = segmented_prefill_used;
+    if (segmented_prefill_used && !generation_candidates.empty()) {
+        size_t selected_candidate_idx = 0;
+        for (size_t i = 0; i < generation_candidates.size(); ++i) {
+            if (generation_candidates[i].source == response.selected_answer_source) {
+                selected_candidate_idx = i;
+                break;
+            }
+        }
+        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
+        response.generation_decode_steps =
+            generation_candidates[selected_candidate_idx].output.m_output_num_token > 1
+            ? generation_candidates[selected_candidate_idx].output.m_output_num_token - 1
+            : 0;
+    }
+
     response.context_chunks = std::move(selected_context);
     response.metrics.generation_ms = stage_timer.elapsed_time_ms();
 
