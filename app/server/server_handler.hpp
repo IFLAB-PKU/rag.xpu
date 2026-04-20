@@ -143,6 +143,20 @@ struct SegmentedPrefillQueueDemoOutput {
     size_t queue_wait_ms = 0;
 };
 
+struct GenerationDecodeTask {
+    std::string query_type;
+    size_t decode_rounds = 1;
+    size_t decode_steps_per_round = 1;
+    std::vector<std::string> input_segments;
+};
+
+struct GenerationDecodeCandidate {
+    std::string source;
+    ModelOutput output;
+    size_t queue_wait_ms = 0;
+    size_t rounds_executed = 0;
+};
+
 using ServerSessionId = int;
 
 struct ServerSession {
@@ -856,7 +870,8 @@ inline ModelOutput run_blocking_decode_steps_from_artifact(
     const ModelInput &input,
     const powerserve::Tokenizer &tokenizer,
     BlockingPrefillResult &prefill_result,
-    size_t max_decode_steps
+    size_t max_decode_steps,
+    bool has_prefill_boundary = true
 ) {
     using namespace powerserve;
 
@@ -873,7 +888,7 @@ inline ModelOutput run_blocking_decode_steps_from_artifact(
         auto token = prefill_result.iter->next();
         step++;
 
-        if (step == 1) {
+        if (has_prefill_boundary && step == 1) {
             const double prefill_tps_log = prefill_result.prefill_time_ms > 0
                 ? prefill_result.num_prefill_token * 1000.0 / prefill_result.prefill_time_ms
                 : 0.0;
@@ -954,6 +969,66 @@ inline ModelOutput run_blocking_decode_from_artifact(
     );
 }
 
+inline GenerationDecodeCandidate run_blocking_decode_rounds_from_artifact(
+    const ModelInput &input,
+    const powerserve::Tokenizer &tokenizer,
+    BlockingPrefillResult &prefill_result,
+    const GenerationDecodeTask &decode_task
+) {
+    const size_t max_rounds = decode_task.decode_rounds == 0 ? 1 : decode_task.decode_rounds;
+    const size_t steps_per_round = decode_task.decode_steps_per_round == 0 ? 1 : decode_task.decode_steps_per_round;
+
+    ModelOutput merged_output{
+        .m_text = {},
+        .m_embedding = {},
+        .m_rerank_results = {},
+        .m_input_num_token = prefill_result.num_prefill_token,
+        .m_output_num_token = 1,
+        .m_stop_reason = std::string{"length"}
+    };
+
+    size_t total_decode_tokens = 0;
+    size_t rounds_executed = 0;
+    for (size_t round = 0; round < max_rounds; ++round) {
+        if (prefill_result.iter->end()) {
+            break;
+        }
+
+        ModelOutput round_output = run_blocking_decode_steps_from_artifact(
+            input,
+            tokenizer,
+            prefill_result,
+            steps_per_round,
+            round == 0
+        );
+        ++rounds_executed;
+
+        if (!round_output.m_text.empty()) {
+            merged_output.m_text += round_output.m_text;
+        }
+
+        size_t round_decode_tokens = round_output.m_output_num_token;
+        if (round == 0 && round_decode_tokens > 0) {
+            round_decode_tokens -= 1;
+        }
+        total_decode_tokens += round_decode_tokens;
+
+        merged_output.m_stop_reason = round_output.m_stop_reason;
+        if (round_output.m_stop_reason.has_value() && round_output.m_stop_reason.value() == "stop") {
+            break;
+        }
+    }
+
+    merged_output.m_output_num_token = total_decode_tokens + 1;
+
+    return {
+        .source = decode_task.query_type,
+        .output = std::move(merged_output),
+        .queue_wait_ms = 0,
+        .rounds_executed = rounds_executed,
+    };
+}
+
 inline ModelOutput blocking_inference_segmented_prefill_prototype(
     const ModelContext &context,
     const ModelInput &input,
@@ -1026,14 +1101,40 @@ public:
         return result_future.get();
     }
 
+    GenerationDecodeCandidate run_multiround(
+        const ModelContext &context,
+        const ModelInput &input,
+        const GenerationDecodeTask &decode_task
+    ) {
+        SegmentedPrefillQueueTask task;
+        task.context = &context;
+        task.input = input;
+        task.input_segments = decode_task.input_segments;
+        task.max_decode_steps = decode_task.decode_steps_per_round;
+        task.multiround_mode = true;
+        task.decode_task = decode_task;
+        task.enqueued_at = std::chrono::steady_clock::now();
+
+        auto result_future = task.multiround_result_promise.get_future();
+        {
+            std::lock_guard<std::mutex> lock_guard(m_lock);
+            m_queue.push_back(std::move(task));
+        }
+        m_cv.notify_one();
+        return result_future.get();
+    }
+
 private:
     struct SegmentedPrefillQueueTask {
         const ModelContext *context = nullptr;
         ModelInput input;
         std::vector<std::string> input_segments;
         size_t max_decode_steps = 1;
+        bool multiround_mode = false;
+        GenerationDecodeTask decode_task;
         std::chrono::steady_clock::time_point enqueued_at;
         std::promise<SegmentedPrefillQueueDemoOutput> result_promise;
+        std::promise<GenerationDecodeCandidate> multiround_result_promise;
     };
 
     std::deque<SegmentedPrefillQueueTask> m_queue;
@@ -1092,20 +1193,34 @@ private:
                     kv_position_begin
                 );
 
-                ModelOutput output = run_blocking_decode_steps_from_artifact(
-                    input,
-                    tokenizer,
-                    prefill_result,
-                    task.max_decode_steps
-                );
-
-                task.result_promise.set_value({
-                    .output = std::move(output),
-                    .prefill_artifact = std::move(prefill_artifact),
-                    .queue_wait_ms = queue_wait_ms,
-                });
+                if (task.multiround_mode) {
+                    GenerationDecodeCandidate candidate = run_blocking_decode_rounds_from_artifact(
+                        input,
+                        tokenizer,
+                        prefill_result,
+                        task.decode_task
+                    );
+                    candidate.queue_wait_ms = queue_wait_ms;
+                    task.multiround_result_promise.set_value(std::move(candidate));
+                } else {
+                    ModelOutput output = run_blocking_decode_steps_from_artifact(
+                        input,
+                        tokenizer,
+                        prefill_result,
+                        task.max_decode_steps
+                    );
+                    task.result_promise.set_value({
+                        .output = std::move(output),
+                        .prefill_artifact = std::move(prefill_artifact),
+                        .queue_wait_ms = queue_wait_ms,
+                    });
+                }
             } catch (...) {
-                task.result_promise.set_exception(std::current_exception());
+                if (task.multiround_mode) {
+                    task.multiround_result_promise.set_exception(std::current_exception());
+                } else {
+                    task.result_promise.set_exception(std::current_exception());
+                }
             }
         }
     }
@@ -1119,6 +1234,15 @@ inline SegmentedPrefillQueueDemoOutput blocking_inference_segmented_prefill_queu
 ) {
     static SequentialSegmentPrefillQueueDemo queue_demo;
     return queue_demo.run(context, input, input_segments, max_decode_steps);
+}
+
+inline GenerationDecodeCandidate blocking_inference_segmented_prefill_multiround_decode(
+    const ModelContext &context,
+    const ModelInput &input,
+    const GenerationDecodeTask &decode_task
+) {
+    static SequentialSegmentPrefillQueueDemo queue_demo;
+    return queue_demo.run_multiround(context, input, decode_task);
 }
 
 struct PDOrchestratorTask {

@@ -47,6 +47,8 @@ struct RagRequest {
     size_t top_n = 5;
     size_t max_tokens = 128;
     size_t generation_decode_steps = 64;
+    size_t generation_decode_rounds = 1;
+    size_t generation_decode_steps_per_round = 64;
     float temperature = 0.2F;
 };
 
@@ -62,6 +64,15 @@ struct RagStageMetrics {
     size_t total_ms = 0;
 };
 
+struct DecodeTaskDebugSummary {
+    std::string source;
+    size_t output_tokens = 0;
+    size_t output_chars = 0;
+    size_t rounds_executed = 0;
+    std::string stop_reason;
+    std::string text_preview;
+};
+
 struct RagResponse {
     std::string answer;
     std::string mode_requested;
@@ -69,14 +80,15 @@ struct RagResponse {
     std::string query_used;
     std::vector<std::string> sub_queries;
     bool generation_segmented_prefill_used = false;
-    bool generation_prefill_queue_demo_used = false;
     size_t generation_prefill_queue_wait_ms = 0;
-    size_t generation_prefill_artifact_tokens = 0;
-    size_t generation_prefill_artifact_kv_begin = 0;
-    size_t generation_prefill_artifact_kv_end = 0;
     size_t generation_decode_steps_configured = 1;
     size_t generation_decode_steps = 0;
-    std::vector<size_t> generation_segment_chars;
+    size_t decode_rounds_executed_total = 0;
+    size_t decode_task_count = 0;
+    std::string selected_answer_source;
+    size_t candidate_count = 0;
+    std::string merge_policy_version;
+    std::vector<DecodeTaskDebugSummary> decode_task_summaries;
     std::vector<std::string> context_chunks;
     std::vector<size_t> top_k_indices;
     std::vector<size_t> top_n_indices;
@@ -368,6 +380,98 @@ inline std::vector<std::string> build_generation_segments(
     return segments;
 }
 
+inline std::vector<GenerationDecodeTask> build_generation_decode_tasks(
+    const std::string &query,
+    const std::vector<std::string> &sub_queries,
+    const std::vector<std::string> &context_chunks,
+    size_t decode_rounds,
+    size_t decode_steps_per_round
+) {
+    std::vector<GenerationDecodeTask> tasks;
+    tasks.reserve(1 + sub_queries.size());
+
+    GenerationDecodeTask original_task;
+    original_task.query_type = "original";
+    original_task.decode_rounds = decode_rounds;
+    original_task.decode_steps_per_round = decode_steps_per_round;
+    original_task.input_segments = build_generation_segments(query, sub_queries, context_chunks);
+    tasks.push_back(std::move(original_task));
+
+    for (const auto &sub_query : sub_queries) {
+        GenerationDecodeTask task;
+        task.query_type = "subquery";
+        task.decode_rounds = decode_rounds;
+        task.decode_steps_per_round = decode_steps_per_round;
+        task.input_segments = build_generation_segments(sub_query, {}, context_chunks);
+        tasks.push_back(std::move(task));
+    }
+
+    return tasks;
+}
+
+struct GenerationMergeResult {
+    size_t selected_candidate_idx = 0;
+    std::string selected_source = "original";
+    std::string answer;
+    std::string merge_policy_version = "v1-rule";
+};
+
+inline GenerationMergeResult merge_generation_candidates_v1(const std::vector<GenerationDecodeCandidate> &candidates) {
+    GenerationMergeResult result;
+    if (candidates.empty()) {
+        return result;
+    }
+
+    auto is_candidate_valid = [](const GenerationDecodeCandidate &candidate) {
+        return !rag_trim(candidate.output.m_text).empty();
+    };
+
+    const size_t min_original_chars = 24;
+
+    size_t original_idx = 0;
+    bool found_original = false;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (candidates[i].source == "original") {
+            original_idx = i;
+            found_original = true;
+            break;
+        }
+    }
+
+    size_t best_subquery_idx = original_idx;
+    bool found_valid_subquery = false;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (candidates[i].source != "subquery" || !is_candidate_valid(candidates[i])) {
+            continue;
+        }
+        if (!found_valid_subquery || candidates[i].output.m_text.size() > candidates[best_subquery_idx].output.m_text.size()) {
+            best_subquery_idx = i;
+            found_valid_subquery = true;
+        }
+    }
+
+    if (!found_original) {
+        result.selected_candidate_idx = found_valid_subquery ? best_subquery_idx : 0;
+    } else {
+        const bool original_valid = is_candidate_valid(candidates[original_idx]);
+        const bool original_too_short = candidates[original_idx].output.m_text.size() < min_original_chars;
+        const bool original_stop_abnormal =
+            !candidates[original_idx].output.m_stop_reason.has_value() ||
+            (candidates[original_idx].output.m_stop_reason.value() != "stop" &&
+             candidates[original_idx].output.m_stop_reason.value() != "length");
+
+        if ((!original_valid || original_too_short || original_stop_abnormal) && found_valid_subquery) {
+            result.selected_candidate_idx = best_subquery_idx;
+        } else {
+            result.selected_candidate_idx = original_idx;
+        }
+    }
+
+    result.selected_source = candidates[result.selected_candidate_idx].source;
+    result.answer = candidates[result.selected_candidate_idx].output.m_text;
+    return result;
+}
+
 inline std::string maybe_expand_rag_query(
     ServerContext &server_context,
     const RagRequest &request,
@@ -539,41 +643,106 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
     // 7) Generation
     stage_timer = Timer{};
-    const std::vector<std::string> generation_segments =
-        build_generation_segments(request.query, response.sub_queries, selected_context);
+    const std::vector<GenerationDecodeTask> generation_tasks = build_generation_decode_tasks(
+        request.query,
+        response.sub_queries,
+        selected_context,
+        request.generation_decode_rounds,
+        request.generation_decode_steps_per_round
+    );
 
-    ModelOutput generation_out;
+    std::vector<GenerationDecodeCandidate> generation_candidates;
+    generation_candidates.reserve(generation_tasks.size());
+
     bool segmented_prefill_used = false;
     try {
-        ModelInput generation_input = make_generation_input(request, generation_segments.front());
-        const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
-        SegmentedPrefillQueueDemoOutput queue_demo_output = blocking_inference_segmented_prefill_queue_demo(
-            generation_context,
-            generation_input,
-            generation_segments,
-            request.generation_decode_steps
-        );
-        generation_out = std::move(queue_demo_output.output);
-        response.generation_prefill_queue_demo_used = true;
-        response.generation_prefill_queue_wait_ms = queue_demo_output.queue_wait_ms;
-        response.generation_prefill_artifact_tokens = queue_demo_output.prefill_artifact.prefill_tokens_total;
-        response.generation_prefill_artifact_kv_begin = queue_demo_output.prefill_artifact.kv_position_begin;
-        response.generation_prefill_artifact_kv_end = queue_demo_output.prefill_artifact.kv_position_end;
+        for (const auto &task : generation_tasks) {
+            const std::string task_prompt = task.input_segments.empty()
+                ? build_generation_prompt(request.query, selected_context)
+                : task.input_segments.front();
+
+            ModelInput generation_input = make_generation_input(request, task_prompt);
+            const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
+            GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_multiround_decode(
+                generation_context,
+                generation_input,
+                task
+            );
+            generation_candidates.push_back(std::move(candidate));
+        }
+
+        const GenerationMergeResult merge_result = merge_generation_candidates_v1(generation_candidates);
+        const GenerationDecodeCandidate &selected_candidate = generation_candidates.at(merge_result.selected_candidate_idx);
+        response.answer = selected_candidate.output.m_text;
+        response.generation_prefill_queue_wait_ms = 0;
+        response.decode_rounds_executed_total = 0;
+        for (const auto &candidate : generation_candidates) {
+            response.decode_rounds_executed_total += candidate.rounds_executed;
+            response.generation_prefill_queue_wait_ms += candidate.queue_wait_ms;
+        }
+        response.decode_task_count = generation_tasks.size();
+        response.candidate_count = generation_candidates.size();
+        response.selected_answer_source = merge_result.selected_source;
+        response.merge_policy_version = merge_result.merge_policy_version;
+        response.decode_task_summaries.clear();
+        response.decode_task_summaries.reserve(generation_candidates.size());
+        for (const auto &candidate : generation_candidates) {
+            std::string preview = candidate.output.m_text;
+            constexpr size_t kMaxPreviewChars = 200;
+            if (preview.size() > kMaxPreviewChars) {
+                preview.resize(kMaxPreviewChars);
+                remove_incomplete_utf8_char(preview);
+            }
+            response.decode_task_summaries.push_back({
+                .source = candidate.source,
+                .output_tokens = candidate.output.m_output_num_token > 1 ? candidate.output.m_output_num_token - 1 : 0,
+                .output_chars = candidate.output.m_text.size(),
+                .rounds_executed = candidate.rounds_executed,
+                .stop_reason = candidate.output.m_stop_reason.value_or("unknown"),
+                .text_preview = std::move(preview),
+            });
+        }
+
         segmented_prefill_used = true;
     } catch (...) {
         const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
-        generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+        const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+        response.answer = generation_out.m_text;
+        response.decode_rounds_executed_total = 1;
+        response.decode_task_count = 1;
+        response.selected_answer_source = "original";
+        response.candidate_count = 1;
+        response.merge_policy_version = "v1-rule";
+        response.decode_task_summaries = {
+            DecodeTaskDebugSummary{
+                .source = "original",
+                .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
+                .output_chars = generation_out.m_text.size(),
+                .rounds_executed = 1,
+                .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
+                .text_preview = generation_out.m_text,
+            }
+        };
+
+        response.generation_decode_steps =
+            generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
+        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
     }
 
-    response.answer = generation_out.m_text;
     response.generation_segmented_prefill_used = segmented_prefill_used;
-    response.generation_decode_steps_configured = request.generation_decode_steps;
-    response.generation_decode_steps =
-        generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
-    response.generation_segment_chars.clear();
-    response.generation_segment_chars.reserve(generation_segments.size());
-    for (const auto &segment : generation_segments) {
-        response.generation_segment_chars.push_back(segment.size());
+    if (segmented_prefill_used && !generation_candidates.empty()) {
+        size_t selected_candidate_idx = 0;
+        for (size_t i = 0; i < generation_candidates.size(); ++i) {
+            if (generation_candidates[i].source == response.selected_answer_source) {
+                selected_candidate_idx = i;
+                break;
+            }
+        }
+        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
+        response.generation_decode_steps =
+            generation_candidates[selected_candidate_idx].output.m_output_num_token > 1
+            ? generation_candidates[selected_candidate_idx].output.m_output_num_token - 1
+            : 0;
     }
     response.context_chunks = std::move(selected_context);
     response.metrics.generation_ms = stage_timer.elapsed_time_ms();
@@ -726,6 +895,21 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     const std::string generation_prompt = build_generation_prompt(query_branch.expanded_query, selected_context);
     const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
     response.answer = generation_out.m_text;
+    response.decode_rounds_executed_total = 1;
+    response.decode_task_count = 1;
+    response.selected_answer_source = "original";
+    response.candidate_count = 1;
+    response.merge_policy_version = "v0-single-path";
+    response.decode_task_summaries = {
+        DecodeTaskDebugSummary{
+            .source = "original",
+            .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
+            .output_chars = generation_out.m_text.size(),
+            .rounds_executed = 1,
+            .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
+            .text_preview = generation_out.m_text,
+        }
+    };
     response.context_chunks = std::move(selected_context);
     response.metrics.generation_ms = stage_timer.elapsed_time_ms();
 

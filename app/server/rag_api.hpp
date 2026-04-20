@@ -34,6 +34,9 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
     rag_request.top_n = request.value("top_n", size_t{5});
     rag_request.max_tokens = request.value("max_tokens", size_t{128});
     rag_request.generation_decode_steps = request.value("generation_decode_steps", size_t{64});
+    rag_request.generation_decode_rounds = request.value("generation_decode_rounds", size_t{1});
+    rag_request.generation_decode_steps_per_round =
+        request.value("generation_decode_steps_per_round", rag_request.generation_decode_steps);
     rag_request.temperature = request.value("temperature", 0.2F);
 
     rag_request.generation_model = request.value("generation_model", request.value("model", std::string{}));
@@ -53,6 +56,12 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
     if (rag_request.generation_decode_steps == 0) {
         throw std::invalid_argument("'generation_decode_steps' must be > 0");
     }
+    if (rag_request.generation_decode_rounds == 0) {
+        throw std::invalid_argument("'generation_decode_rounds' must be > 0");
+    }
+    if (rag_request.generation_decode_steps_per_round == 0) {
+        throw std::invalid_argument("'generation_decode_steps_per_round' must be > 0");
+    }
 
     return rag_request;
 }
@@ -69,6 +78,18 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
         nlohmann::json{{"stage", "total"}, {"ms", response.metrics.total_ms}}
     });
 
+    nlohmann::json decode_task_summaries_json = nlohmann::json::array();
+    for (const auto &summary : response.decode_task_summaries) {
+        decode_task_summaries_json.push_back({
+            {"source", summary.source},
+            {"output_tokens", summary.output_tokens},
+            {"output_chars", summary.output_chars},
+            {"rounds_executed", summary.rounds_executed},
+            {"stop_reason", summary.stop_reason},
+            {"text_preview", summary.text_preview}
+        });
+    }
+
     return {
         {"object", "rag.result"},
         {"mode_requested", response.mode_requested},
@@ -81,14 +102,15 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
                     {"top_n_indices", response.top_n_indices},
                     {"sub_queries", response.sub_queries},
                     {"generation_segmented_prefill_used", response.generation_segmented_prefill_used},
-                    {"generation_prefill_queue_demo_used", response.generation_prefill_queue_demo_used},
                     {"generation_prefill_queue_wait_ms", response.generation_prefill_queue_wait_ms},
-                    {"generation_prefill_artifact_tokens", response.generation_prefill_artifact_tokens},
-                    {"generation_prefill_artifact_kv_begin", response.generation_prefill_artifact_kv_begin},
-                    {"generation_prefill_artifact_kv_end", response.generation_prefill_artifact_kv_end},
                     {"generation_decode_steps_configured", response.generation_decode_steps_configured},
                     {"generation_decode_steps", response.generation_decode_steps},
-                    {"generation_segment_chars", response.generation_segment_chars}}},
+                    {"decode_rounds_executed_total", response.decode_rounds_executed_total},
+                    {"decode_task_count", response.decode_task_count},
+                    {"selected_answer_source", response.selected_answer_source},
+                    {"candidate_count", response.candidate_count},
+                    {"merge_policy_version", response.merge_policy_version},
+                    {"decode_task_summaries", decode_task_summaries_json}}},
         {"stage_metrics_ms",
          {{"indexing", response.metrics.indexing_ms},
           {"query_expand", response.metrics.query_expand_ms},
