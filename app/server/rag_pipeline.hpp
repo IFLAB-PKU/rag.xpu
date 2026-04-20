@@ -49,6 +49,9 @@ struct RagRequest {
     size_t generation_decode_steps = 64;
     size_t generation_decode_rounds = 1;
     size_t generation_decode_steps_per_round = 64;
+    std::string generation_prefill_backend = "auto";
+    std::string generation_decode_backend = "auto";
+    std::string generation_pd_route_mode = "single_backend";
     float temperature = 0.2F;
 };
 
@@ -88,6 +91,13 @@ struct RagResponse {
     std::string selected_answer_source;
     size_t candidate_count = 0;
     std::string merge_policy_version;
+    std::string generation_prefill_backend_target = "auto";
+    std::string generation_decode_backend_target = "auto";
+    std::string generation_pd_route_mode_requested = "single_backend";
+    std::string generation_pd_route_mode_used = "single_backend";
+    bool generation_split_backend_effective = false;
+    bool generation_kv_bridge_available = false;
+    std::string generation_route_note;
     std::vector<DecodeTaskDebugSummary> decode_task_summaries;
     std::vector<std::string> context_chunks;
     std::vector<size_t> top_k_indices;
@@ -98,6 +108,157 @@ struct RagResponse {
 inline size_t next_rag_request_id() {
     static std::atomic_size_t request_counter{0};
     return request_counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+struct GenerationRoutePlan {
+    std::string prefill_backend_target = "auto";
+    std::string decode_backend_target = "auto";
+    std::string route_mode_requested = "single_backend";
+    std::string route_mode_used = "single_backend";
+    bool split_backend_effective = false;
+    bool kv_bridge_available = false;
+    std::string route_note;
+};
+
+inline std::string normalize_backend_target(std::string backend) {
+    const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+    while (!backend.empty() && is_space(static_cast<unsigned char>(backend.front()))) {
+        backend.erase(backend.begin());
+    }
+    while (!backend.empty() && is_space(static_cast<unsigned char>(backend.back()))) {
+        backend.pop_back();
+    }
+    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (backend == "cpu" || backend == "npu" || backend == "auto") {
+        return backend;
+    }
+    return "auto";
+}
+
+inline std::string normalize_pd_route_mode(std::string mode) {
+    const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
+    while (!mode.empty() && is_space(static_cast<unsigned char>(mode.front()))) {
+        mode.erase(mode.begin());
+    }
+    while (!mode.empty() && is_space(static_cast<unsigned char>(mode.back()))) {
+        mode.pop_back();
+    }
+    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (mode == "single_backend" || mode == "split_backend") {
+        return mode;
+    }
+    return "single_backend";
+}
+
+inline bool is_npu_available_in_binary() {
+#if defined(POWERSERVE_WITH_QNN)
+    return true;
+#else
+    return false;
+#endif
+}
+
+inline std::string normalize_model_name(std::string model_name) {
+    std::transform(model_name.begin(), model_name.end(), model_name.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return model_name;
+}
+
+inline bool model_has_inproc_kv_bridge(const std::string &generation_model) {
+    // Current bridge capability is model-specific: Qwen3 has sync_qnn_kv_to_cpu().
+    const std::string normalized = normalize_model_name(generation_model);
+    return normalized.find("qwen3") != std::string::npos;
+}
+
+inline std::string resolve_prefill_backend_target(const std::string &target, bool npu_available) {
+    if (target == "auto") {
+        return npu_available ? "npu" : "cpu";
+    }
+    return target;
+}
+
+inline std::string resolve_decode_backend_target(const std::string &target, bool npu_available) {
+    if (target == "auto") {
+        // Keep decode on CPU by default to match current hetero intent.
+        return "cpu";
+    }
+    if (target == "npu" && !npu_available) {
+        return "cpu";
+    }
+    return target;
+}
+
+inline bool is_kv_bridge_available_for_route(
+    const RagRequest &request,
+    const std::string &resolved_prefill_backend,
+    const std::string &resolved_decode_backend,
+    bool npu_available
+) {
+    if (!npu_available) {
+        return false;
+    }
+    if (resolved_prefill_backend != "npu" || resolved_decode_backend != "cpu") {
+        return false;
+    }
+    return model_has_inproc_kv_bridge(request.generation_model);
+}
+
+inline GenerationRoutePlan plan_generation_route(const RagRequest &request) {
+    GenerationRoutePlan plan;
+
+    plan.prefill_backend_target = normalize_backend_target(request.generation_prefill_backend);
+    plan.decode_backend_target = normalize_backend_target(request.generation_decode_backend);
+    plan.route_mode_requested = normalize_pd_route_mode(request.generation_pd_route_mode);
+    plan.route_mode_used = plan.route_mode_requested;
+    const bool npu_available = is_npu_available_in_binary();
+    if (plan.prefill_backend_target == "npu" && !npu_available) {
+        plan.prefill_backend_target = "auto";
+        plan.route_note = "prefill_backend npu unavailable in current binary; fallback to auto";
+    }
+    if (plan.decode_backend_target == "npu" && !npu_available) {
+        plan.decode_backend_target = "auto";
+        if (!plan.route_note.empty()) {
+            plan.route_note += "; ";
+        }
+        plan.route_note += "decode_backend npu unavailable in current binary; fallback to auto";
+    }
+
+    plan.prefill_backend_target = resolve_prefill_backend_target(plan.prefill_backend_target, npu_available);
+    plan.decode_backend_target = resolve_decode_backend_target(plan.decode_backend_target, npu_available);
+    plan.kv_bridge_available = is_kv_bridge_available_for_route(
+        request,
+        plan.prefill_backend_target,
+        plan.decode_backend_target,
+        npu_available
+    );
+
+    if (plan.route_mode_requested == "split_backend" && plan.prefill_backend_target == plan.decode_backend_target) {
+        plan.route_mode_used = "single_backend";
+        plan.split_backend_effective = false;
+        if (!plan.route_note.empty()) {
+            plan.route_note += "; ";
+        }
+        plan.route_note += "split_backend requested but resolved backends are identical; force single_backend";
+        return plan;
+    }
+
+    if (plan.route_mode_requested == "split_backend" && !plan.kv_bridge_available) {
+        plan.route_mode_used = "single_backend";
+        plan.split_backend_effective = false;
+        if (!plan.route_note.empty()) {
+            plan.route_note += "; ";
+        }
+        plan.route_note += "kv_bridge unavailable; force single_backend";
+        return plan;
+    }
+
+    plan.split_backend_effective = plan.route_mode_used == "split_backend";
+    return plan;
 }
 
 inline std::string rag_trim(std::string s) {
@@ -526,6 +687,14 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     response.mode_requested = request.mode;
     response.mode_used = request.mode == "hetero_parallel" ? "sequential" : request.mode;
     response.query_used = request.query;
+    const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
+    response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
+    response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
+    response.generation_pd_route_mode_requested = generation_route_plan.route_mode_requested;
+    response.generation_pd_route_mode_used = generation_route_plan.route_mode_used;
+    response.generation_split_backend_effective = generation_route_plan.split_backend_effective;
+    response.generation_kv_bridge_available = generation_route_plan.kv_bridge_available;
+    response.generation_route_note = generation_route_plan.route_note;
 
     Timer total_timer;
 
@@ -782,6 +951,14 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     response.mode_requested = request.mode;
     response.mode_used = "hetero_parallel";
     response.query_used = request.query;
+    const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
+    response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
+    response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
+    response.generation_pd_route_mode_requested = generation_route_plan.route_mode_requested;
+    response.generation_pd_route_mode_used = generation_route_plan.route_mode_used;
+    response.generation_split_backend_effective = generation_route_plan.split_backend_effective;
+    response.generation_kv_bridge_available = generation_route_plan.kv_bridge_available;
+    response.generation_route_note = generation_route_plan.route_note;
 
     Timer total_timer;
 

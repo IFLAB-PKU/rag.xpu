@@ -137,6 +137,32 @@ struct PrefillArtifact {
     size_t kv_position_end = 0;
 };
 
+struct PrefillArtifactV2 {
+    size_t request_id = 0;
+    std::string model_id;
+    std::string backend_id = "inproc";
+    std::string session_id = "local";
+    size_t segment_progress = 0;
+    size_t prefill_tokens_total = 0;
+    size_t kv_valid_begin = 0;
+    size_t kv_valid_end = 0;
+    std::string tokenizer_version = "default";
+};
+
+inline PrefillArtifactV2 make_prefill_artifact_v2(const PrefillArtifact &artifact, size_t segment_progress = 0) {
+    return {
+        .request_id = artifact.request_id,
+        .model_id = artifact.model_id,
+        .backend_id = "inproc",
+        .session_id = "local",
+        .segment_progress = segment_progress,
+        .prefill_tokens_total = artifact.prefill_tokens_total,
+        .kv_valid_begin = artifact.kv_position_begin,
+        .kv_valid_end = artifact.kv_position_end,
+        .tokenizer_version = "default",
+    };
+}
+
 struct SegmentedPrefillQueueDemoOutput {
     ModelOutput output;
     PrefillArtifact prefill_artifact;
@@ -969,7 +995,94 @@ inline ModelOutput run_blocking_decode_from_artifact(
     );
 }
 
+class PrefillExecutor {
+public:
+    virtual ~PrefillExecutor() = default;
+
+    virtual BlockingPrefillResult run_prefill(
+        const ModelContext &context,
+        const ModelInput &input,
+        const std::string &input_prompt,
+        powerserve::SamplerChain &sampler
+    ) = 0;
+
+    virtual BlockingPrefillResult run_prefill_segmented(
+        const ModelContext &context,
+        const ModelInput &input,
+        const std::vector<std::string> &input_segments,
+        powerserve::SamplerChain &sampler
+    ) = 0;
+};
+
+class DecodeExecutor {
+public:
+    virtual ~DecodeExecutor() = default;
+
+    virtual ModelOutput run_decode_steps(
+        const ModelInput &input,
+        const powerserve::Tokenizer &tokenizer,
+        BlockingPrefillResult &prefill_result,
+        size_t max_decode_steps,
+        bool has_prefill_boundary = true
+    ) = 0;
+
+    virtual ModelOutput run_decode(
+        const ModelInput &input,
+        const powerserve::Tokenizer &tokenizer,
+        BlockingPrefillResult &prefill_result
+    ) = 0;
+};
+
+class LocalPrefillExecutor final : public PrefillExecutor {
+public:
+    BlockingPrefillResult run_prefill(
+        const ModelContext &context,
+        const ModelInput &input,
+        const std::string &input_prompt,
+        powerserve::SamplerChain &sampler
+    ) override {
+        return run_blocking_prefill(context, input, input_prompt, sampler);
+    }
+
+    BlockingPrefillResult run_prefill_segmented(
+        const ModelContext &context,
+        const ModelInput &input,
+        const std::vector<std::string> &input_segments,
+        powerserve::SamplerChain &sampler
+    ) override {
+        return run_blocking_prefill_segmented(context, input, input_segments, sampler);
+    }
+};
+
+class LocalDecodeExecutor final : public DecodeExecutor {
+public:
+    ModelOutput run_decode_steps(
+        const ModelInput &input,
+        const powerserve::Tokenizer &tokenizer,
+        BlockingPrefillResult &prefill_result,
+        size_t max_decode_steps,
+        bool has_prefill_boundary = true
+    ) override {
+        return run_blocking_decode_steps_from_artifact(
+            input,
+            tokenizer,
+            prefill_result,
+            max_decode_steps,
+            has_prefill_boundary
+        );
+    }
+
+    ModelOutput run_decode(
+        const ModelInput &input,
+        const powerserve::Tokenizer &tokenizer,
+        BlockingPrefillResult &prefill_result
+    ) override {
+        return run_blocking_decode_from_artifact(input, tokenizer, prefill_result);
+    }
+};
+
 inline GenerationDecodeCandidate run_blocking_decode_rounds_from_artifact(
+    DecodeExecutor &decode_executor,
     const ModelInput &input,
     const powerserve::Tokenizer &tokenizer,
     BlockingPrefillResult &prefill_result,
@@ -994,7 +1107,7 @@ inline GenerationDecodeCandidate run_blocking_decode_rounds_from_artifact(
             break;
         }
 
-        ModelOutput round_output = run_blocking_decode_steps_from_artifact(
+        ModelOutput round_output = decode_executor.run_decode_steps(
             input,
             tokenizer,
             prefill_result,
@@ -1047,15 +1160,17 @@ inline ModelOutput blocking_inference_segmented_prefill_prototype(
     sampler_config.top_p          = input.m_top_p;
     sampler_config.temperature    = input.m_temperature;
     powerserve::SamplerChain sampler{sampler_config, tokenizer};
+    LocalPrefillExecutor prefill_executor;
+    LocalDecodeExecutor decode_executor;
 
-    BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
+    BlockingPrefillResult prefill_result = prefill_executor.run_prefill_segmented(
         context,
         input,
         input_segments,
         sampler
     );
 
-    return run_blocking_decode_steps_from_artifact(input, tokenizer, prefill_result, max_decode_steps);
+    return decode_executor.run_decode_steps(input, tokenizer, prefill_result, max_decode_steps);
 }
 
 inline std::shared_ptr<std::mutex> get_or_create_model_exec_mutex(const std::string &model_id);
@@ -1142,6 +1257,8 @@ private:
     std::condition_variable m_cv;
     std::thread m_worker;
     bool m_shutdown = false;
+    LocalPrefillExecutor m_prefill_executor;
+    LocalDecodeExecutor m_decode_executor;
 
     void worker_loop() {
         while (true) {
@@ -1180,7 +1297,7 @@ private:
 
                 std::string model_id = context.m_model_ptr->m_config->model_id;
                 const size_t kv_position_begin = context.m_model_ptr->m_platform->get_kv_position(model_id);
-                BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
+                BlockingPrefillResult prefill_result = m_prefill_executor.run_prefill_segmented(
                     context,
                     input,
                     task.input_segments,
@@ -1195,6 +1312,7 @@ private:
 
                 if (task.multiround_mode) {
                     GenerationDecodeCandidate candidate = run_blocking_decode_rounds_from_artifact(
+                        m_decode_executor,
                         input,
                         tokenizer,
                         prefill_result,
@@ -1203,7 +1321,7 @@ private:
                     candidate.queue_wait_ms = queue_wait_ms;
                     task.multiround_result_promise.set_value(std::move(candidate));
                 } else {
-                    ModelOutput output = run_blocking_decode_steps_from_artifact(
+                    ModelOutput output = m_decode_executor.run_decode_steps(
                         input,
                         tokenizer,
                         prefill_result,
@@ -1333,6 +1451,8 @@ private:
     std::thread m_prefill_worker;
     std::thread m_decode_worker;
     bool m_shutdown = false;
+    LocalPrefillExecutor m_prefill_executor;
+    LocalDecodeExecutor m_decode_executor;
 
     void prefill_worker_loop() {
         while (true) {
@@ -1369,7 +1489,12 @@ private:
                 task.model_exec_lock = std::unique_lock<std::mutex>(*task.model_exec_mutex);
 
                 POWERSERVE_LOG_INFO("pd orchestrator: prefill request {} start", input.request_id);
-                task.prefill_result = run_blocking_prefill(context, input, task.input_prompt, *task.sampler_ptr);
+                task.prefill_result = m_prefill_executor.run_prefill(
+                    context,
+                    input,
+                    task.input_prompt,
+                    *task.sampler_ptr
+                );
 
                 {
                     std::lock_guard<std::mutex> lock_guard(m_lock);
@@ -1407,8 +1532,11 @@ private:
                 const auto &tokenizer = *context.m_tokenizer_ptr;
 
                 POWERSERVE_LOG_INFO("pd orchestrator: decode request {} start", input.request_id);
-                ModelOutput output =
-                    run_blocking_decode_from_artifact(input, tokenizer, task.prefill_result.value());
+                ModelOutput output = m_decode_executor.run_decode(
+                    input,
+                    tokenizer,
+                    task.prefill_result.value()
+                );
                 task.result_promise.set_value(std::move(output));
             } catch (...) {
                 task.result_promise.set_exception(std::current_exception());
