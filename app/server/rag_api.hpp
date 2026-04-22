@@ -39,7 +39,6 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
         request.value("generation_decode_steps_per_round", rag_request.generation_decode_steps);
     rag_request.generation_prefill_backend = request.value("generation_prefill_backend", std::string{"auto"});
     rag_request.generation_decode_backend = request.value("generation_decode_backend", std::string{"auto"});
-    rag_request.generation_pd_route_mode = request.value("generation_pd_route_mode", std::string{"single_backend"});
     rag_request.temperature = request.value("temperature", 0.2F);
 
     rag_request.generation_model = request.value("generation_model", request.value("model", std::string{}));
@@ -68,11 +67,9 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
 
     const std::string prefill_backend = normalize_backend_target(rag_request.generation_prefill_backend);
     const std::string decode_backend = normalize_backend_target(rag_request.generation_decode_backend);
-    const std::string pd_route_mode = normalize_pd_route_mode(rag_request.generation_pd_route_mode);
 
     rag_request.generation_prefill_backend = prefill_backend;
     rag_request.generation_decode_backend = decode_backend;
-    rag_request.generation_pd_route_mode = pd_route_mode;
 
     return rag_request;
 }
@@ -123,9 +120,6 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
                     {"merge_policy_version", response.merge_policy_version},
                     {"generation_prefill_backend_target", response.generation_prefill_backend_target},
                     {"generation_decode_backend_target", response.generation_decode_backend_target},
-                    {"generation_pd_route_mode_requested", response.generation_pd_route_mode_requested},
-                    {"generation_pd_route_mode_used", response.generation_pd_route_mode_used},
-                    {"generation_split_backend_effective", response.generation_split_backend_effective},
                     {"generation_kv_bridge_available", response.generation_kv_bridge_available},
                     {"generation_route_note", response.generation_route_note},
                     {"decode_task_summaries", decode_task_summaries_json}}},

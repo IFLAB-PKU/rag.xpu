@@ -110,10 +110,9 @@ struct ModelInput {
     size_t m_top_n;                       
 
     /* RAG generation route metadata */
+    bool m_generation_route_enabled = false;
     std::string m_generation_prefill_backend_target = "auto";
     std::string m_generation_decode_backend_target = "auto";
-    std::string m_generation_pd_route_mode_used = "single_backend";
-    bool m_generation_kv_bridge_available = false;
 
     /* Metadata */
 
@@ -1304,13 +1303,15 @@ private:
                 sampler_config.temperature    = input.m_temperature;
                 powerserve::SamplerChain sampler{sampler_config, tokenizer};
 
-                if (!set_generation_backend_route(context, input.m_generation_prefill_backend_target)) {
-                    POWERSERVE_LOG_WARN(
-                        "prefill backend route fallback to cpu, request_id={}, target={}",
-                        input.request_id,
-                        input.m_generation_prefill_backend_target
-                    );
-                    (void)set_generation_backend_route(context, "cpu");
+                if (input.m_generation_route_enabled) {
+                    if (!set_generation_backend_route(context, input.m_generation_prefill_backend_target)) {
+                        POWERSERVE_LOG_WARN(
+                            "prefill backend route fallback to cpu, request_id={}, target={}",
+                            input.request_id,
+                            input.m_generation_prefill_backend_target
+                        );
+                        (void)set_generation_backend_route(context, "cpu");
+                    }
                 }
 
                 std::string model_id = context.m_model_ptr->m_config->model_id;
@@ -1328,13 +1329,15 @@ private:
                     kv_position_begin
                 );
 
-                if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
-                    POWERSERVE_LOG_WARN(
-                        "decode backend route fallback to cpu, request_id={}, target={}",
-                        input.request_id,
-                        input.m_generation_decode_backend_target
-                    );
-                    (void)set_generation_backend_route(context, "cpu");
+                if (input.m_generation_route_enabled) {
+                    if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
+                        POWERSERVE_LOG_WARN(
+                            "decode backend route fallback to cpu, request_id={}, target={}",
+                            input.request_id,
+                            input.m_generation_decode_backend_target
+                        );
+                        (void)set_generation_backend_route(context, "cpu");
+                    }
                 }
 
                 if (task.multiround_mode) {
@@ -1576,6 +1579,17 @@ private:
                 POWERSERVE_ASSERT(task.model_exec_mutex != nullptr);
                 task.model_exec_lock = std::unique_lock<std::mutex>(*task.model_exec_mutex);
 
+                if (input.m_generation_route_enabled) {
+                    if (!set_generation_backend_route(context, input.m_generation_prefill_backend_target)) {
+                        POWERSERVE_LOG_WARN(
+                            "orchestrator prefill backend route fallback to cpu, request_id={}, target={}",
+                            input.request_id,
+                            input.m_generation_prefill_backend_target
+                        );
+                        (void)set_generation_backend_route(context, "cpu");
+                    }
+                }
+
                 POWERSERVE_LOG_INFO("pd orchestrator: prefill request {} start", input.request_id);
                 task.prefill_result = m_prefill_executor.run_prefill(
                     context,
@@ -1618,6 +1632,17 @@ private:
                 const auto &context   = *task.context;
                 const auto &input     = *task.input;
                 const auto &tokenizer = *context.m_tokenizer_ptr;
+
+                if (input.m_generation_route_enabled) {
+                    if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
+                        POWERSERVE_LOG_WARN(
+                            "orchestrator decode backend route fallback to cpu, request_id={}, target={}",
+                            input.request_id,
+                            input.m_generation_decode_backend_target
+                        );
+                        (void)set_generation_backend_route(context, "cpu");
+                    }
+                }
 
                 POWERSERVE_LOG_INFO("pd orchestrator: decode request {} start", input.request_id);
                 ModelOutput output = m_decode_executor.run_decode(

@@ -51,7 +51,6 @@ struct RagRequest {
     size_t generation_decode_steps_per_round = 64;
     std::string generation_prefill_backend = "auto";
     std::string generation_decode_backend = "auto";
-    std::string generation_pd_route_mode = "single_backend";
     float temperature = 0.2F;
 };
 
@@ -93,9 +92,6 @@ struct RagResponse {
     std::string merge_policy_version;
     std::string generation_prefill_backend_target = "auto";
     std::string generation_decode_backend_target = "auto";
-    std::string generation_pd_route_mode_requested = "single_backend";
-    std::string generation_pd_route_mode_used = "single_backend";
-    bool generation_split_backend_effective = false;
     bool generation_kv_bridge_available = false;
     std::string generation_route_note;
     std::vector<DecodeTaskDebugSummary> decode_task_summaries;
@@ -113,9 +109,6 @@ inline size_t next_rag_request_id() {
 struct GenerationRoutePlan {
     std::string prefill_backend_target = "auto";
     std::string decode_backend_target = "auto";
-    std::string route_mode_requested = "single_backend";
-    std::string route_mode_used = "single_backend";
-    bool split_backend_effective = false;
     bool kv_bridge_available = false;
     std::string route_note;
 };
@@ -135,23 +128,6 @@ inline std::string normalize_backend_target(std::string backend) {
         return backend;
     }
     return "auto";
-}
-
-inline std::string normalize_pd_route_mode(std::string mode) {
-    const auto is_space = [](unsigned char ch) { return std::isspace(ch) != 0; };
-    while (!mode.empty() && is_space(static_cast<unsigned char>(mode.front()))) {
-        mode.erase(mode.begin());
-    }
-    while (!mode.empty() && is_space(static_cast<unsigned char>(mode.back()))) {
-        mode.pop_back();
-    }
-    std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (mode == "single_backend" || mode == "split_backend") {
-        return mode;
-    }
-    return "single_backend";
 }
 
 inline bool is_npu_available_in_binary() {
@@ -213,8 +189,6 @@ inline GenerationRoutePlan plan_generation_route(const RagRequest &request) {
 
     plan.prefill_backend_target = normalize_backend_target(request.generation_prefill_backend);
     plan.decode_backend_target = normalize_backend_target(request.generation_decode_backend);
-    plan.route_mode_requested = normalize_pd_route_mode(request.generation_pd_route_mode);
-    plan.route_mode_used = plan.route_mode_requested;
     const bool npu_available = is_npu_available_in_binary();
     if (plan.prefill_backend_target == "npu" && !npu_available) {
         plan.prefill_backend_target = "auto";
@@ -236,28 +210,6 @@ inline GenerationRoutePlan plan_generation_route(const RagRequest &request) {
         plan.decode_backend_target,
         npu_available
     );
-
-    if (plan.route_mode_requested == "split_backend" && plan.prefill_backend_target == plan.decode_backend_target) {
-        plan.route_mode_used = "single_backend";
-        plan.split_backend_effective = false;
-        if (!plan.route_note.empty()) {
-            plan.route_note += "; ";
-        }
-        plan.route_note += "split_backend requested but resolved backends are identical; force single_backend";
-        return plan;
-    }
-
-    if (plan.route_mode_requested == "split_backend" && !plan.kv_bridge_available) {
-        plan.route_mode_used = "single_backend";
-        plan.split_backend_effective = false;
-        if (!plan.route_note.empty()) {
-            plan.route_note += "; ";
-        }
-        plan.route_note += "kv_bridge unavailable; force single_backend";
-        return plan;
-    }
-
-    plan.split_backend_effective = plan.route_mode_used == "split_backend";
     return plan;
 }
 
@@ -475,10 +427,9 @@ inline ModelInput make_generation_input(const RagRequest &request, const std::st
 }
 
 inline void apply_generation_route_to_input(ModelInput &input, const GenerationRoutePlan &route_plan) {
+    input.m_generation_route_enabled = true;
     input.m_generation_prefill_backend_target = route_plan.prefill_backend_target;
     input.m_generation_decode_backend_target = route_plan.decode_backend_target;
-    input.m_generation_pd_route_mode_used = route_plan.route_mode_used;
-    input.m_generation_kv_bridge_available = route_plan.kv_bridge_available;
 }
 
 inline ModelInput make_embedding_input(const std::string &model, const std::string &text) {
@@ -643,6 +594,7 @@ inline GenerationMergeResult merge_generation_candidates_v1(const std::vector<Ge
 inline std::string maybe_expand_rag_query(
     ServerContext &server_context,
     const RagRequest &request,
+    const GenerationRoutePlan &generation_route_plan,
     size_t &query_expand_ms
 ) {
     using namespace powerserve;
@@ -665,6 +617,7 @@ inline std::string maybe_expand_rag_query(
     "Your output:";
 
     ModelInput expand_input = make_generation_input(request, expand_prompt);
+    apply_generation_route_to_input(expand_input, generation_route_plan);
     expand_input.m_model = model_for_expand;
     expand_input.m_temperature = 0.2F;
     expand_input.m_max_num_token = std::min<size_t>(request.max_tokens, size_t{96});
@@ -697,9 +650,6 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
     response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
     response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
-    response.generation_pd_route_mode_requested = generation_route_plan.route_mode_requested;
-    response.generation_pd_route_mode_used = generation_route_plan.route_mode_used;
-    response.generation_split_backend_effective = generation_route_plan.split_backend_effective;
     response.generation_kv_bridge_available = generation_route_plan.kv_bridge_available;
     response.generation_route_note = generation_route_plan.route_note;
 
@@ -735,7 +685,12 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     }
 
     // 3) Query expansion (optional)
-    const std::string expanded_query = maybe_expand_rag_query(server_context, request, response.metrics.query_expand_ms);
+    const std::string expanded_query = maybe_expand_rag_query(
+        server_context,
+        request,
+        generation_route_plan,
+        response.metrics.query_expand_ms
+    );
 
     // Phase A: in sequential mode, cache split sub-queries for later phases.
     if (request.enable_query_expansion) {
@@ -883,7 +838,9 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         segmented_prefill_used = true;
     } catch (...) {
         const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
-        const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+        ModelInput fallback_generation_input = make_generation_input(request, generation_prompt);
+        apply_generation_route_to_input(fallback_generation_input, generation_route_plan);
+        const ModelOutput generation_out = completion(server_context, fallback_generation_input);
         response.answer = generation_out.m_text;
         response.decode_rounds_executed_total = 1;
         response.decode_task_count = 1;
@@ -962,9 +919,6 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
     response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
     response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
-    response.generation_pd_route_mode_requested = generation_route_plan.route_mode_requested;
-    response.generation_pd_route_mode_used = generation_route_plan.route_mode_used;
-    response.generation_split_backend_effective = generation_route_plan.split_backend_effective;
     response.generation_kv_bridge_available = generation_route_plan.kv_bridge_available;
     response.generation_route_note = generation_route_plan.route_note;
 
@@ -1002,7 +956,8 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     auto query_branch_future = std::async(std::launch::async, [&server_context, &request]() -> QueryBranchOutput {
         QueryBranchOutput out;
-        out.expanded_query = maybe_expand_rag_query(server_context, request, out.query_expand_ms);
+        const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
+        out.expanded_query = maybe_expand_rag_query(server_context, request, generation_route_plan, out.query_expand_ms);
         if (request.enable_query_expansion) {
             // Keep Step1-compatible sub-query behavior in parallel mode.
             const auto parsed_sub_queries = rag_split_sub_queries(out.expanded_query);
@@ -1154,7 +1109,9 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
         segmented_prefill_used = true;
     } catch (...) {
         const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
-        const ModelOutput generation_out = completion(server_context, make_generation_input(request, generation_prompt));
+        ModelInput fallback_generation_input = make_generation_input(request, generation_prompt);
+        apply_generation_route_to_input(fallback_generation_input, generation_route_plan);
+        const ModelOutput generation_out = completion(server_context, fallback_generation_input);
         response.answer = generation_out.m_text;
         response.decode_rounds_executed_total = 1;
         response.decode_task_count = 1;
