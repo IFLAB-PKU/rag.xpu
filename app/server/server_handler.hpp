@@ -30,6 +30,8 @@
 #include "sampler/sampler_chain.hpp"
 #include "speculative/spec_model.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <condition_variable>
 #include <chrono>
@@ -106,6 +108,12 @@ struct ModelInput {
     /* Rerank Extension */
     std::vector<std::string> m_documents; // lsh add for rerank
     size_t m_top_n;                       
+
+    /* RAG generation route metadata */
+    std::string m_generation_prefill_backend_target = "auto";
+    std::string m_generation_decode_backend_target = "auto";
+    std::string m_generation_pd_route_mode_used = "single_backend";
+    bool m_generation_kv_bridge_available = false;
 
     /* Metadata */
 
@@ -1176,6 +1184,7 @@ inline ModelOutput blocking_inference_segmented_prefill_prototype(
 inline std::shared_ptr<std::mutex> get_or_create_model_exec_mutex(const std::string &model_id);
 inline std::string get_model_exec_lock_key(const ModelContext &context);
 inline std::unique_lock<std::mutex> lock_model_execution(const ModelContext &context);
+inline bool set_generation_backend_route(const ModelContext &context, const std::string &backend_target);
 
 class SequentialSegmentPrefillQueueDemo {
 public:
@@ -1295,6 +1304,15 @@ private:
                 sampler_config.temperature    = input.m_temperature;
                 powerserve::SamplerChain sampler{sampler_config, tokenizer};
 
+                if (!set_generation_backend_route(context, input.m_generation_prefill_backend_target)) {
+                    POWERSERVE_LOG_WARN(
+                        "prefill backend route fallback to cpu, request_id={}, target={}",
+                        input.request_id,
+                        input.m_generation_prefill_backend_target
+                    );
+                    (void)set_generation_backend_route(context, "cpu");
+                }
+
                 std::string model_id = context.m_model_ptr->m_config->model_id;
                 const size_t kv_position_begin = context.m_model_ptr->m_platform->get_kv_position(model_id);
                 BlockingPrefillResult prefill_result = m_prefill_executor.run_prefill_segmented(
@@ -1309,6 +1327,15 @@ private:
                     prefill_result,
                     kv_position_begin
                 );
+
+                if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
+                    POWERSERVE_LOG_WARN(
+                        "decode backend route fallback to cpu, request_id={}, target={}",
+                        input.request_id,
+                        input.m_generation_decode_backend_target
+                    );
+                    (void)set_generation_backend_route(context, "cpu");
+                }
 
                 if (task.multiround_mode) {
                     GenerationDecodeCandidate candidate = run_blocking_decode_rounds_from_artifact(
@@ -1392,6 +1419,67 @@ inline std::shared_ptr<std::mutex> get_or_create_model_exec_mutex(const std::str
 inline std::string get_model_exec_lock_key(const ModelContext &context) {
     POWERSERVE_ASSERT(context.m_model_ptr != nullptr);
     return context.m_model_ptr->m_config->model_id;
+}
+
+inline powerserve::KVCacheInterface *get_cpu_kv_cache_for_route(const ModelContext &context) {
+    POWERSERVE_ASSERT(context.m_model_ptr != nullptr);
+    const std::string &model_id = context.m_model_ptr->m_config->model_id;
+    auto ggml_iter = context.m_model_ptr->m_platform->ggml_backends.find(model_id);
+    if (ggml_iter == context.m_model_ptr->m_platform->ggml_backends.end()) {
+        return nullptr;
+    }
+    if (!ggml_iter->second || !ggml_iter->second->m_kv || !ggml_iter->second->m_kv->kv_cache) {
+        return nullptr;
+    }
+    return ggml_iter->second->m_kv->kv_cache.get();
+}
+
+#if defined(POWERSERVE_WITH_QNN)
+inline powerserve::KVCacheInterface *get_npu_kv_cache_for_route(const ModelContext &context) {
+    POWERSERVE_ASSERT(context.m_model_ptr != nullptr);
+    if (!context.m_model_ptr->m_platform || !context.m_model_ptr->m_platform->qnn_backend) {
+        return nullptr;
+    }
+    const std::string &model_id = context.m_model_ptr->m_config->model_id;
+    return context.m_model_ptr->m_platform->qnn_backend->get_kv_interface(model_id);
+}
+#endif
+
+inline bool set_generation_backend_route(const ModelContext &context, const std::string &backend_target) {
+    POWERSERVE_ASSERT(context.m_model_ptr != nullptr);
+
+    std::string normalized_target = backend_target;
+    std::transform(normalized_target.begin(), normalized_target.end(), normalized_target.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    powerserve::KVCacheInterface *cpu_kv = get_cpu_kv_cache_for_route(context);
+    if (cpu_kv == nullptr) {
+        return false;
+    }
+
+    if (normalized_target == "cpu" || normalized_target == "auto") {
+        context.m_model_ptr->kv_cache = cpu_kv;
+        return true;
+    }
+
+    if (normalized_target == "npu") {
+#if defined(POWERSERVE_WITH_QNN)
+        powerserve::KVCacheInterface *npu_kv = get_npu_kv_cache_for_route(context);
+        if (npu_kv == nullptr) {
+            context.m_model_ptr->kv_cache = cpu_kv;
+            return false;
+        }
+        context.m_model_ptr->kv_cache = npu_kv;
+        return true;
+#else
+        context.m_model_ptr->kv_cache = cpu_kv;
+        return false;
+#endif
+    }
+
+    context.m_model_ptr->kv_cache = cpu_kv;
+    return true;
 }
 
 inline std::unique_lock<std::mutex> lock_model_execution(const ModelContext &context) {

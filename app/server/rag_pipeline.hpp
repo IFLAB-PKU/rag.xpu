@@ -474,6 +474,13 @@ inline ModelInput make_generation_input(const RagRequest &request, const std::st
     };
 }
 
+inline void apply_generation_route_to_input(ModelInput &input, const GenerationRoutePlan &route_plan) {
+    input.m_generation_prefill_backend_target = route_plan.prefill_backend_target;
+    input.m_generation_decode_backend_target = route_plan.decode_backend_target;
+    input.m_generation_pd_route_mode_used = route_plan.route_mode_used;
+    input.m_generation_kv_bridge_available = route_plan.kv_bridge_available;
+}
+
 inline ModelInput make_embedding_input(const std::string &model, const std::string &text) {
     return ModelInput{
         .m_model = model,
@@ -831,6 +838,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
                 : task.input_segments.front();
 
             ModelInput generation_input = make_generation_input(request, task_prompt);
+            apply_generation_route_to_input(generation_input, generation_route_plan);
             const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
             GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_multiround_decode(
                 generation_context,
@@ -1100,6 +1108,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                 : task.input_segments.front();
 
             ModelInput generation_input = make_generation_input(request, task_prompt);
+            apply_generation_route_to_input(generation_input, generation_route_plan);
             const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
             GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_multiround_decode(
                 generation_context,
