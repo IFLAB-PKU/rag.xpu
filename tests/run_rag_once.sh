@@ -15,6 +15,11 @@ GEN_PREFILL_BACKEND="npu"
 GEN_DECODE_BACKEND="cpu"
 
 case "$PROFILE" in
+  pure_cpu_sequential|cpu_sequential)
+    MODE="sequential"
+    GEN_PREFILL_BACKEND="cpu"
+    GEN_DECODE_BACKEND="cpu"
+    ;;
   pure_npu_sequential|npu_sequential)
     MODE="sequential"
     GEN_PREFILL_BACKEND="npu"
@@ -31,10 +36,12 @@ Usage:
   ./tests/run_rag_once.sh [profile]
 
 Profiles:
+  pure_cpu_sequential  prefill=cpu, decode=cpu, mode=sequential
   pure_npu_sequential  prefill=npu, decode=npu, mode=sequential
   npu_cpu              prefill=npu, decode=cpu, mode=hetero_parallel
 
 Examples:
+  ./tests/run_rag_once.sh pure_cpu_sequential
   ./tests/run_rag_once.sh pure_npu_sequential
   ./tests/run_rag_once.sh npu_cpu
 EOF
@@ -42,7 +49,7 @@ EOF
     ;;
   *)
     echo "unknown profile: $PROFILE" >&2
-    echo "try: pure_npu_sequential | npu_cpu" >&2
+    echo "try: pure_cpu_sequential | pure_npu_sequential | npu_cpu" >&2
     exit 2
     ;;
 esac
@@ -112,5 +119,6 @@ echo "phone doc path: $PHONE_DOC"
 echo "local payload:  $LOCAL_PAYLOAD"
 
 # How to run
+# ./tests/run_rag_once.sh pure_cpu_sequential
 # ./tests/run_rag_once.sh pure_npu_sequential
 # ./tests/run_rag_once.sh npu_cpu
