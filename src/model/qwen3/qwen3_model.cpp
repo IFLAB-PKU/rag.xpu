@@ -25,11 +25,52 @@
 #include "tokenizer/tokenizer.hpp"
 
 #include <cstring>
+#include <cmath>
 #include <memory>
+#include <numeric>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace powerserve {
+
+namespace {
+
+auto qwen3_using_opencl(const Platform &platform, const std::string &model_id) -> bool {
+    return platform.using_opencl(model_id);
+}
+
+void qwen3_reset_kv_batch_size(Platform &platform, const std::string &model_id, size_t batch_size) {
+    if (qwen3_using_opencl(platform, model_id)) {
+        platform.opencl_backends[model_id]->reset_kv_batch_size(batch_size);
+    } else {
+        platform.ggml_backends[model_id]->reset_kv_batch_size(batch_size);
+    }
+}
+
+auto qwen3_get_cache_tensors(Platform &platform, const std::string &model_id, size_t layer)
+    -> std::pair<Tensor, Tensor> {
+    if (qwen3_using_opencl(platform, model_id)) {
+        return platform.opencl_backends[model_id]->get_cache_tensors(layer);
+    }
+    return platform.ggml_backends[model_id]->m_kv->get_cache(layer);
+}
+
+auto qwen3_to_cpu_tensor(Platform &platform, const std::string &model_id, const TensorNode *node) -> Tensor {
+    POWERSERVE_ASSERT(node != nullptr);
+    POWERSERVE_ASSERT(node->m_data != nullptr);
+
+    if (dynamic_cast<CPUBuffer *>(node->m_data.get()) != nullptr) {
+        return *node;
+    }
+
+    Tensor host_tensor(node->m_dtype, node->m_shape);
+    host_tensor.m_data = CPUBuffer::create_buffer<float>(node->m_shape);
+    platform.get_backend(model_id)->copy(&host_tensor, node);
+    return host_tensor;
+}
+
+} // namespace
 
 Qwen3Model::Qwen3Model(const std::string &filename, const std::shared_ptr<ModelConfig> &config) : Model(filename) {
     {
@@ -83,9 +124,9 @@ auto Qwen3Model::forward(
 #endif
     {
         if (!lazy_load) {
-            m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
+            qwen3_reset_kv_batch_size(*m_platform, m_config->model_id, batch_size);
             for (size_t L = 0; L < llm_config.n_layers; L++) {
-                auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+                auto [k_cache, v_cache] = qwen3_get_cache_tensors(*m_platform, m_config->model_id, L);
                 /* lsh 修改起始 */
                 bool is_need_bias = false;
                 /* lsh 修改结束 */
@@ -118,7 +159,8 @@ auto Qwen3Model::forward(
         return LogitsVector();
     }
 
-    return LogitsVector(logits->m_data, m_config->llm.vocab_size, batch_size);
+    auto host_logits = qwen3_to_cpu_tensor(*m_platform, m_config->model_id, logits);
+    return LogitsVector(host_logits.m_data, m_config->llm.vocab_size, batch_size);
 }
 
 auto Qwen3Model::decode(Sampler &sampler, const std::vector<Token> tokens, const std::vector<int> pos, bool lm_head)
@@ -187,9 +229,9 @@ auto Qwen3Model::compute_embedding(const std::vector<Token> &tokens, size_t batc
         } else
 #endif
         if(!lazy_load){
-            m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(current_bs); // use REAL batch size
+            qwen3_reset_kv_batch_size(*m_platform, m_config->model_id, current_bs); // use REAL batch size
             for (size_t L = 0; L < llm_config.n_layers; L++) {
-                auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+                auto [k_cache, v_cache] = qwen3_get_cache_tensors(*m_platform, m_config->model_id, L);
                 bool is_need_bias = false;
                 auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), batch_pos, mask, is_need_bias);
                 auto ffn_o = m_ffn->build(g, att_o, L);
@@ -217,7 +259,8 @@ auto Qwen3Model::compute_embedding(const std::vector<Token> &tokens, size_t batc
 
         if (is_last_batch){
             const size_t dim = llm_config.dim; //embd_dim, see src/core/config.cpp
-            EmbeddingVector view(x->m_data, dim, current_bs);
+            auto host_x = qwen3_to_cpu_tensor(*m_platform, m_config->model_id, x);
+            EmbeddingVector view(host_x.m_data, dim, current_bs);
             auto last_token_span = view.embeddings.back();
 
             std::vector<float> embedding(dim);
@@ -301,9 +344,9 @@ auto Qwen3Model::compute_rerank_score(const std::vector<Token> &tokens, size_t b
         } else
 #endif
         if (!lazy_load) {
-            m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(current_bs);
+            qwen3_reset_kv_batch_size(*m_platform, m_config->model_id, current_bs);
             for (size_t L = 0; L < llm_config.n_layers; L++) {
-                auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+                auto [k_cache, v_cache] = qwen3_get_cache_tensors(*m_platform, m_config->model_id, L);
                 bool is_need_bias = false;
                 auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), batch_pos, mask, is_need_bias);
                 auto ffn_o = m_ffn->build(g, att_o, L);
@@ -351,7 +394,8 @@ auto Qwen3Model::compute_rerank_score(const std::vector<Token> &tokens, size_t b
                 POWERSERVE_LOG_ERROR("Rerank output dimension mismatch, expected 2 but got {}", dim);
                 POWERSERVE_ASSERT(false, "Qwen3-Reranker expect 2 for output dimension.");
             } // Qwen3-Reranker output dim is 2
-            float* probs = static_cast<float*>(dynamic_cast<CPUBuffer&>(*x->m_data).m_data);
+            auto host_x = qwen3_to_cpu_tensor(*m_platform, m_config->model_id, x);
+            float* probs = static_cast<float*>(dynamic_cast<CPUBuffer&>(*host_x.m_data).m_data);
             float score = probs[valid_token_idx * dim + 0]; // Index 0 is 'yes'
 
             m_platform->ggml_backends[m_config->model_id]->reset_threadpool();
