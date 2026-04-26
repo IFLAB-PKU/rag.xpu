@@ -2232,8 +2232,136 @@ void OpenCLBackend::rope(
     }
 }
 
-void OpenCLBackend::softmax(const Tensor * /*out*/, const Tensor * /*x*/) const {
-    POWERSERVE_ABORT("OpenCLBackend::softmax TODO");
+void OpenCLBackend::softmax(const Tensor *out, const Tensor *x) const {
+    if (!initialized) {
+        POWERSERVE_LOG_ERROR("OpenCL backend not initialized");
+        return;
+    }
+    POWERSERVE_ASSERT(out && x);
+
+    if (out->m_dtype != DataType::FP32 || x->m_dtype != DataType::FP32) {
+        POWERSERVE_LOG_ERROR("OpenCLBackend::softmax only supports FP32");
+        return;
+    }
+
+    auto *self = const_cast<OpenCLBackend *>(this);
+
+    Tensor tmp_x_dev;
+    const Tensor *x_dev = ensure_contiguous_or_pack_f32(self, x, /*n_dims_check=*/4, tmp_x_dev);
+
+    if (out->m_shape != x_dev->m_shape) {
+        POWERSERVE_LOG_ERROR("softmax: out shape != x shape");
+        return;
+    }
+
+    auto *context = self->context.get();
+    if (!context || !self->kernel_manager) {
+        POWERSERVE_LOG_ERROR("softmax: OpenCL context or kernel manager not initialized");
+        return;
+    }
+
+    auto *x_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(x_dev)->get<BaseBuffer>());
+    auto *o_cl = dynamic_cast<OpenCLBuffer *>(&const_cast<Tensor *>(out)->get<BaseBuffer>());
+    if (!x_cl || !o_cl) {
+        POWERSERVE_LOG_ERROR("softmax: x/out must be OpenCLBuffer");
+        return;
+    }
+
+    const bool use_strict_softmax = false;
+    const char *softmax_kernel_name = use_strict_softmax
+        ? "kernel_soft_max_strict_backup"
+        : "kernel_soft_max";
+
+    cl_kernel kernel = self->kernel_manager->get_kernel(softmax_kernel_name);
+    if (!kernel) {
+        POWERSERVE_LOG_ERROR("softmax: {} not found", softmax_kernel_name);
+        return;
+    }
+
+    const cl_mem mem_x = x_cl->get_device_buffer();
+    const cl_mem mem_o = o_cl->get_device_buffer();
+    if (!mem_x || !mem_o) {
+        POWERSERVE_LOG_ERROR("softmax: invalid cl_mem buffers");
+        return;
+    }
+
+    const cl_ulong off_x = (cl_ulong)x_cl->get_base_offset();
+    const cl_ulong off_o = (cl_ulong)o_cl->get_base_offset();
+
+    const auto x_stride = x_cl->get_stride();
+    const cl_ulong nb01 = (cl_ulong)x_stride[1];
+    const cl_ulong nb02 = (cl_ulong)x_stride[2];
+    const cl_ulong nb03 = (cl_ulong)x_stride[3];
+
+    const auto o_stride = o_cl->get_stride();
+    const cl_ulong nb1 = (cl_ulong)o_stride[1];
+    const cl_ulong nb2 = (cl_ulong)o_stride[2];
+    const cl_ulong nb3 = (cl_ulong)o_stride[3];
+
+    const int ne00 = (int)x_dev->m_shape[0];
+    const int ne01 = (int)x_dev->m_shape[1];
+    const int ne02 = (int)x_dev->m_shape[2];
+    const int ne03 = (int)x_dev->m_shape[3];
+
+    const int ne12 = ne02;
+    const int ne13 = ne03;
+    const float scale = 1.0f;
+    const float max_bias = 0.0f;
+    const float m0 = 1.0f;
+    const float m1 = 1.0f;
+    const int n_head_log2_i = 1;
+
+    cl_uint arg = 0;
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_x));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_mem), &mem_o));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &off_o));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &ne00));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb01));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb02));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb03));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &ne12));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &ne13));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb01));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb02));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb03));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb1));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb2));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &nb3));
+
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &scale));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &max_bias));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &m0));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(float), &m1));
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, sizeof(int), &n_head_log2_i));
+
+    size_t local_work_size = 1;
+    if (!use_strict_softmax) {
+        const uint32_t cap = std::min<uint32_t>(64u, std::max<uint32_t>(1u, (uint32_t)ne00));
+        local_work_size = (size_t)(1u << floor_log2_u32(cap));
+    }
+    const size_t local_mem_size = local_work_size * sizeof(float);
+    OCL_RETURN_IF_ERROR(context, clSetKernelArg(kernel, arg++, local_mem_size, nullptr));
+
+    const size_t global[3] = {
+        static_cast<size_t>(ne01) * local_work_size,
+        static_cast<size_t>(ne02),
+        static_cast<size_t>(ne03)
+    };
+    const size_t local[3] = { local_work_size, 1, 1 };
+    OCL_RETURN_IF_ERROR(context, clEnqueueNDRangeKernel(
+        context->get_queue(), kernel,
+        3, nullptr, global, local,
+        0, nullptr, nullptr
+    ));
 }
 
 void OpenCLBackend::get_mask(const Tensor *out, const std::vector<int> &pos) const {

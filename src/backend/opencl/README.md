@@ -97,7 +97,7 @@ This backend is still under active development. A few practical limitations matt
 - Not every backend API is fully implemented
 - Some paths still fall back to GGML/CPU behavior
 - Several operators are currently strict about dtype and layout
-- `softmax()` is not implemented; the current attention path uses `softmax_ext()`
+- `softmax()` reuses the `softmax_ext()` kernel without mask or bias and currently supports FP32 tensors
 - The current KV cache storage is `FP32`
 - The OpenCL KV cache supports batched updates, but its storage layout is still per-layer `{kv_dim, max_seq_len}` without a separate batch dimension
 
