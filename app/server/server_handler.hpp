@@ -170,16 +170,9 @@ inline PrefillArtifactV2 make_prefill_artifact_v2(const PrefillArtifact &artifac
     };
 }
 
-struct SegmentedPrefillQueueDemoOutput {
-    ModelOutput output;
-    PrefillArtifact prefill_artifact;
-    size_t queue_wait_ms = 0;
-};
-
 struct GenerationDecodeTask {
     std::string query_type;
-    size_t decode_rounds = 1;
-    size_t decode_steps_per_round = 1;
+    size_t max_decode_steps = 1;
     std::vector<std::string> input_segments;
 };
 
@@ -187,7 +180,6 @@ struct GenerationDecodeCandidate {
     std::string source;
     ModelOutput output;
     size_t queue_wait_ms = 0;
-    size_t rounds_executed = 0;
 };
 
 using ServerSessionId = int;
@@ -1088,64 +1080,26 @@ public:
     }
 };
 
-inline GenerationDecodeCandidate run_blocking_decode_rounds_from_artifact(
+inline GenerationDecodeCandidate run_blocking_decode_task_from_artifact(
     DecodeExecutor &decode_executor,
     const ModelInput &input,
     const powerserve::Tokenizer &tokenizer,
     BlockingPrefillResult &prefill_result,
     const GenerationDecodeTask &decode_task
 ) {
-    const size_t max_rounds = decode_task.decode_rounds == 0 ? 1 : decode_task.decode_rounds;
-    const size_t steps_per_round = decode_task.decode_steps_per_round == 0 ? 1 : decode_task.decode_steps_per_round;
-
-    ModelOutput merged_output{
-        .m_text = {},
-        .m_embedding = {},
-        .m_rerank_results = {},
-        .m_input_num_token = prefill_result.num_prefill_token,
-        .m_output_num_token = 1,
-        .m_stop_reason = std::string{"length"}
-    };
-
-    size_t total_decode_tokens = 0;
-    size_t rounds_executed = 0;
-    for (size_t round = 0; round < max_rounds; ++round) {
-        if (prefill_result.iter->end()) {
-            break;
-        }
-
-        ModelOutput round_output = decode_executor.run_decode_steps(
-            input,
-            tokenizer,
-            prefill_result,
-            steps_per_round,
-            round == 0
-        );
-        ++rounds_executed;
-
-        if (!round_output.m_text.empty()) {
-            merged_output.m_text += round_output.m_text;
-        }
-
-        size_t round_decode_tokens = round_output.m_output_num_token;
-        if (round == 0 && round_decode_tokens > 0) {
-            round_decode_tokens -= 1;
-        }
-        total_decode_tokens += round_decode_tokens;
-
-        merged_output.m_stop_reason = round_output.m_stop_reason;
-        if (round_output.m_stop_reason.has_value() && round_output.m_stop_reason.value() == "stop") {
-            break;
-        }
-    }
-
-    merged_output.m_output_num_token = total_decode_tokens + 1;
+    const size_t max_decode_steps = decode_task.max_decode_steps == 0 ? 1 : decode_task.max_decode_steps;
+    ModelOutput output = decode_executor.run_decode_steps(
+        input,
+        tokenizer,
+        prefill_result,
+        max_decode_steps,
+        true
+    );
 
     return {
         .source = decode_task.query_type,
-        .output = std::move(merged_output),
+        .output = std::move(output),
         .queue_wait_ms = 0,
-        .rounds_executed = rounds_executed,
     };
 }
 
@@ -1202,29 +1156,7 @@ public:
         }
     }
 
-    SegmentedPrefillQueueDemoOutput run(
-        const ModelContext &context,
-        const ModelInput &input,
-        const std::vector<std::string> &input_segments,
-        size_t max_decode_steps
-    ) {
-        SegmentedPrefillQueueTask task;
-        task.context = &context;
-        task.input = input;
-        task.input_segments = input_segments;
-        task.max_decode_steps = max_decode_steps;
-        task.enqueued_at = std::chrono::steady_clock::now();
-
-        auto result_future = task.result_promise.get_future();
-        {
-            std::lock_guard<std::mutex> lock_guard(m_lock);
-            m_queue.push_back(std::move(task));
-        }
-        m_cv.notify_one();
-        return result_future.get();
-    }
-
-    GenerationDecodeCandidate run_multiround(
+    GenerationDecodeCandidate run_decode_task(
         const ModelContext &context,
         const ModelInput &input,
         const GenerationDecodeTask &decode_task
@@ -1233,12 +1165,10 @@ public:
         task.context = &context;
         task.input = input;
         task.input_segments = decode_task.input_segments;
-        task.max_decode_steps = decode_task.decode_steps_per_round;
-        task.multiround_mode = true;
         task.decode_task = decode_task;
         task.enqueued_at = std::chrono::steady_clock::now();
 
-        auto result_future = task.multiround_result_promise.get_future();
+        auto result_future = task.decode_task_result_promise.get_future();
         {
             std::lock_guard<std::mutex> lock_guard(m_lock);
             m_queue.push_back(std::move(task));
@@ -1252,12 +1182,9 @@ private:
         const ModelContext *context = nullptr;
         ModelInput input;
         std::vector<std::string> input_segments;
-        size_t max_decode_steps = 1;
-        bool multiround_mode = false;
         GenerationDecodeTask decode_task;
         std::chrono::steady_clock::time_point enqueued_at;
-        std::promise<SegmentedPrefillQueueDemoOutput> result_promise;
-        std::promise<GenerationDecodeCandidate> multiround_result_promise;
+        std::promise<GenerationDecodeCandidate> decode_task_result_promise;
     };
 
     std::deque<SegmentedPrefillQueueTask> m_queue;
@@ -1340,57 +1267,30 @@ private:
                     }
                 }
 
-                if (task.multiround_mode) {
-                    GenerationDecodeCandidate candidate = run_blocking_decode_rounds_from_artifact(
-                        m_decode_executor,
-                        input,
-                        tokenizer,
-                        prefill_result,
-                        task.decode_task
-                    );
-                    candidate.queue_wait_ms = queue_wait_ms;
-                    task.multiround_result_promise.set_value(std::move(candidate));
-                } else {
-                    ModelOutput output = m_decode_executor.run_decode_steps(
-                        input,
-                        tokenizer,
-                        prefill_result,
-                        task.max_decode_steps
-                    );
-                    task.result_promise.set_value({
-                        .output = std::move(output),
-                        .prefill_artifact = std::move(prefill_artifact),
-                        .queue_wait_ms = queue_wait_ms,
-                    });
-                }
+                (void)prefill_artifact;
+                GenerationDecodeCandidate candidate = run_blocking_decode_task_from_artifact(
+                    m_decode_executor,
+                    input,
+                    tokenizer,
+                    prefill_result,
+                    task.decode_task
+                );
+                candidate.queue_wait_ms = queue_wait_ms;
+                task.decode_task_result_promise.set_value(std::move(candidate));
             } catch (...) {
-                if (task.multiround_mode) {
-                    task.multiround_result_promise.set_exception(std::current_exception());
-                } else {
-                    task.result_promise.set_exception(std::current_exception());
-                }
+                task.decode_task_result_promise.set_exception(std::current_exception());
             }
         }
     }
 };
 
-inline SegmentedPrefillQueueDemoOutput blocking_inference_segmented_prefill_queue_demo(
-    const ModelContext &context,
-    const ModelInput &input,
-    const std::vector<std::string> &input_segments,
-    size_t max_decode_steps = 1
-) {
-    static SequentialSegmentPrefillQueueDemo queue_demo;
-    return queue_demo.run(context, input, input_segments, max_decode_steps);
-}
-
-inline GenerationDecodeCandidate blocking_inference_segmented_prefill_multiround_decode(
+inline GenerationDecodeCandidate blocking_inference_segmented_prefill_decode_task(
     const ModelContext &context,
     const ModelInput &input,
     const GenerationDecodeTask &decode_task
 ) {
     static SequentialSegmentPrefillQueueDemo queue_demo;
-    return queue_demo.run_multiround(context, input, decode_task);
+    return queue_demo.run_decode_task(context, input, decode_task);
 }
 
 struct PDOrchestratorTask {

@@ -47,8 +47,6 @@ struct RagRequest {
     size_t top_n = 5;
     size_t max_tokens = 128;
     size_t generation_decode_steps = 64;
-    size_t generation_decode_rounds = 1;
-    size_t generation_decode_steps_per_round = 64;
     std::string generation_prefill_backend = "auto";
     std::string generation_decode_backend = "auto";
     float temperature = 0.2F;
@@ -70,7 +68,6 @@ struct DecodeTaskDebugSummary {
     std::string source;
     size_t output_tokens = 0;
     size_t output_chars = 0;
-    size_t rounds_executed = 0;
     std::string stop_reason;
     std::string text_preview;
 };
@@ -83,9 +80,7 @@ struct RagResponse {
     std::vector<std::string> sub_queries;
     bool generation_segmented_prefill_used = false;
     size_t generation_prefill_queue_wait_ms = 0;
-    size_t generation_decode_steps_configured = 1;
     size_t generation_decode_steps = 0;
-    size_t decode_rounds_executed_total = 0;
     size_t decode_task_count = 0;
     std::string selected_answer_source;
     size_t candidate_count = 0;
@@ -503,24 +498,21 @@ inline std::vector<GenerationDecodeTask> build_generation_decode_tasks(
     const std::string &query,
     const std::vector<std::string> &sub_queries,
     const std::vector<std::string> &context_chunks,
-    size_t decode_rounds,
-    size_t decode_steps_per_round
+    size_t max_decode_steps
 ) {
     std::vector<GenerationDecodeTask> tasks;
     tasks.reserve(1 + sub_queries.size());
 
     GenerationDecodeTask original_task;
     original_task.query_type = "original";
-    original_task.decode_rounds = decode_rounds;
-    original_task.decode_steps_per_round = decode_steps_per_round;
+    original_task.max_decode_steps = max_decode_steps;
     original_task.input_segments = build_generation_segments(query, sub_queries, context_chunks);
     tasks.push_back(std::move(original_task));
 
     for (const auto &sub_query : sub_queries) {
         GenerationDecodeTask task;
         task.query_type = "subquery";
-        task.decode_rounds = decode_rounds;
-        task.decode_steps_per_round = decode_steps_per_round;
+        task.max_decode_steps = max_decode_steps;
         task.input_segments = build_generation_segments(sub_query, {}, context_chunks);
         tasks.push_back(std::move(task));
     }
@@ -778,8 +770,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         request.query,
         response.sub_queries,
         selected_context,
-        request.generation_decode_rounds,
-        request.generation_decode_steps_per_round
+        request.generation_decode_steps
     );
 
     std::vector<GenerationDecodeCandidate> generation_candidates;
@@ -795,7 +786,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
             ModelInput generation_input = make_generation_input(request, task_prompt);
             apply_generation_route_to_input(generation_input, generation_route_plan);
             const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
-            GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_multiround_decode(
+            GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_decode_task(
                 generation_context,
                 generation_input,
                 task
@@ -807,9 +798,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         const GenerationDecodeCandidate &selected_candidate = generation_candidates.at(merge_result.selected_candidate_idx);
         response.answer = selected_candidate.output.m_text;
         response.generation_prefill_queue_wait_ms = 0;
-        response.decode_rounds_executed_total = 0;
         for (const auto &candidate : generation_candidates) {
-            response.decode_rounds_executed_total += candidate.rounds_executed;
             response.generation_prefill_queue_wait_ms += candidate.queue_wait_ms;
         }
         response.decode_task_count = generation_tasks.size();
@@ -829,7 +818,6 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
                 .source = candidate.source,
                 .output_tokens = candidate.output.m_output_num_token > 1 ? candidate.output.m_output_num_token - 1 : 0,
                 .output_chars = candidate.output.m_text.size(),
-                .rounds_executed = candidate.rounds_executed,
                 .stop_reason = candidate.output.m_stop_reason.value_or("unknown"),
                 .text_preview = std::move(preview),
             });
@@ -842,7 +830,6 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         apply_generation_route_to_input(fallback_generation_input, generation_route_plan);
         const ModelOutput generation_out = completion(server_context, fallback_generation_input);
         response.answer = generation_out.m_text;
-        response.decode_rounds_executed_total = 1;
         response.decode_task_count = 1;
         response.selected_answer_source = "original";
         response.candidate_count = 1;
@@ -852,7 +839,6 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
                 .source = "original",
                 .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
                 .output_chars = generation_out.m_text.size(),
-                .rounds_executed = 1,
                 .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
                 .text_preview = generation_out.m_text,
             }
@@ -860,7 +846,6 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
         response.generation_decode_steps =
             generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
-        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
     }
 
     response.generation_segmented_prefill_used = segmented_prefill_used;
@@ -872,7 +857,6 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
                 break;
             }
         }
-        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
         response.generation_decode_steps =
             generation_candidates[selected_candidate_idx].output.m_output_num_token > 1
             ? generation_candidates[selected_candidate_idx].output.m_output_num_token - 1
@@ -975,23 +959,27 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     response.sub_queries = query_branch.sub_queries;
     response.query_used = request.query;
 
-    std::future<ModelOutput> query_embedding_future;
+    const std::vector<std::string> retrieval_queries =
+        response.sub_queries.empty() ? std::vector<std::string>{query_branch.expanded_query} : response.sub_queries;
+
     Timer query_embedding_timer;
     query_embedding_timer = Timer{};
-    query_embedding_future = std::async(std::launch::async, [&server_context, &request, &query_branch]() {
-        return embedding(
-            server_context,
-            make_embedding_input(request.embedding_model, query_branch.expanded_query)
-        );
-    });
+    std::vector<std::vector<float>> query_embeddings;
+    query_embeddings.reserve(retrieval_queries.size());
+    for (const auto &sub_query : retrieval_queries) {
+        const ModelOutput query_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, sub_query));
+        if (query_embedding_out.m_embedding.empty()) {
+            continue;
+        }
+        query_embeddings.push_back(query_embedding_out.m_embedding);
+    }
 
     const DocBranchOutput doc_branch = doc_branch_future.get();
 
-    const ModelOutput query_embedding_out = query_embedding_future.get();
     Timer stage_timer;
     response.metrics.query_embedding_ms = query_embedding_timer.elapsed_time_ms();
-    if (query_embedding_out.m_embedding.empty()) {
-        throw std::runtime_error("query embedding is empty");
+    if (query_embeddings.empty()) {
+        throw std::runtime_error("all query embeddings are empty");
     }
 
     response.metrics.indexing_ms = doc_branch.indexing_ms;
@@ -1001,19 +989,24 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     // Searching
     stage_timer = Timer{};
-    const std::vector<size_t> faiss_top_indices = rag_search_faiss_ip(
-        doc_branch.doc_embeddings,
-        doc_branch.doc_embedding_source_indices,
-        query_embedding_out.m_embedding,
-        request.top_k
-    );
+    std::vector<std::vector<size_t>> per_query_top_indices;
+    per_query_top_indices.reserve(query_embeddings.size());
+    for (const auto &query_embedding : query_embeddings) {
+        per_query_top_indices.push_back(rag_search_faiss_ip(
+            doc_branch.doc_embeddings,
+            doc_branch.doc_embedding_source_indices,
+            query_embedding,
+            request.top_k
+        ));
+    }
+    const std::vector<size_t> merged_top_indices = rag_merge_subquery_hits(per_query_top_indices, request.top_k);
 
-    const size_t actual_top_k = faiss_top_indices.size();
+    const size_t actual_top_k = merged_top_indices.size();
     std::vector<std::string> top_k_docs;
     top_k_docs.reserve(actual_top_k);
     for (size_t i = 0; i < actual_top_k; ++i) {
-        response.top_k_indices.push_back(faiss_top_indices[i]);
-        top_k_docs.push_back(doc_branch.chunks[faiss_top_indices[i]]);
+        response.top_k_indices.push_back(merged_top_indices[i]);
+        top_k_docs.push_back(doc_branch.chunks[merged_top_indices[i]]);
     }
     response.metrics.searching_ms = stage_timer.elapsed_time_ms();
     if (top_k_docs.empty()) {
@@ -1022,7 +1015,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     // Reranking
     stage_timer = Timer{};
-    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, query_branch.expanded_query, top_k_docs));
+    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
 
     std::vector<std::string> selected_context;
     for (const auto &item : rerank_out.m_rerank_results) {
@@ -1048,8 +1041,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
         request.query,
         response.sub_queries,
         selected_context,
-        request.generation_decode_rounds,
-        request.generation_decode_steps_per_round
+        request.generation_decode_steps
     );
 
     std::vector<GenerationDecodeCandidate> generation_candidates;
@@ -1065,7 +1057,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
             ModelInput generation_input = make_generation_input(request, task_prompt);
             apply_generation_route_to_input(generation_input, generation_route_plan);
             const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
-            GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_multiround_decode(
+            GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_decode_task(
                 generation_context,
                 generation_input,
                 task
@@ -1077,9 +1069,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
         const GenerationDecodeCandidate &selected_candidate = generation_candidates.at(merge_result.selected_candidate_idx);
         response.answer = selected_candidate.output.m_text;
         response.generation_prefill_queue_wait_ms = 0;
-        response.decode_rounds_executed_total = 0;
         for (const auto &candidate : generation_candidates) {
-            response.decode_rounds_executed_total += candidate.rounds_executed;
             response.generation_prefill_queue_wait_ms += candidate.queue_wait_ms;
         }
         response.decode_task_count = generation_tasks.size();
@@ -1100,7 +1090,6 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                 .source = candidate.source,
                 .output_tokens = candidate.output.m_output_num_token > 1 ? candidate.output.m_output_num_token - 1 : 0,
                 .output_chars = candidate.output.m_text.size(),
-                .rounds_executed = candidate.rounds_executed,
                 .stop_reason = candidate.output.m_stop_reason.value_or("unknown"),
                 .text_preview = std::move(preview),
             });
@@ -1113,7 +1102,6 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
         apply_generation_route_to_input(fallback_generation_input, generation_route_plan);
         const ModelOutput generation_out = completion(server_context, fallback_generation_input);
         response.answer = generation_out.m_text;
-        response.decode_rounds_executed_total = 1;
         response.decode_task_count = 1;
         response.selected_answer_source = "original";
         response.candidate_count = 1;
@@ -1123,14 +1111,12 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                 .source = "original",
                 .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
                 .output_chars = generation_out.m_text.size(),
-                .rounds_executed = 1,
                 .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
                 .text_preview = generation_out.m_text,
             }
         };
         response.generation_decode_steps =
             generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
-        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
     }
 
     response.generation_segmented_prefill_used = segmented_prefill_used;
@@ -1142,7 +1128,6 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                 break;
             }
         }
-        response.generation_decode_steps_configured = request.generation_decode_steps_per_round;
         response.generation_decode_steps =
             generation_candidates[selected_candidate_idx].output.m_output_num_token > 1
             ? generation_candidates[selected_candidate_idx].output.m_output_num_token - 1
