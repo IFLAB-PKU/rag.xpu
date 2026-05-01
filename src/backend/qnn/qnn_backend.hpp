@@ -34,6 +34,8 @@ struct QNNBackend : powerserve::Backend {
     void load_model(const Path &path, const std::shared_ptr<powerserve::ModelConfig> &model_config);
     void unload_model(const std::shared_ptr<powerserve::ModelConfig> &model_config);
 
+    auto get_kv_interface(const std::string &model_id) const -> KVCacheInterface *;
+
     void forward(
         const std::string &model_id,
         const Tensor *dst,

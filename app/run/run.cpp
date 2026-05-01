@@ -47,10 +47,14 @@ int main(int argc, char *argv[]) {
     auto &platform                                     = main_model->m_platform;
 
     platform->init_ggml_backend(main_model->m_config, config.hyper_params);
+    main_model->kv_cache = platform->ggml_backends[main_model->m_config->model_id]->m_kv->kv_cache.get();
+    POWERSERVE_ASSERT(main_model->kv_cache != nullptr);
 
     if (args.use_spec) {
         draft_model->m_platform = platform;
         platform->init_ggml_backend(draft_model->m_config, config.hyper_params);
+        draft_model->kv_cache = platform->ggml_backends[draft_model->m_config->model_id]->m_kv->kv_cache.get();
+        POWERSERVE_ASSERT(draft_model->kv_cache != nullptr);
     }
 
 #if defined(POWERSERVE_WITH_QNN)
@@ -58,13 +62,16 @@ int main(int argc, char *argv[]) {
         auto &qnn_backend = main_model->m_platform->qnn_backend;
         main_model->m_platform->init_qnn_backend(args.qnn_lib_folder);
         qnn_backend->load_model(config.main_model_dir / powerserve::qnn::QNN_WORKSPACE_DIR_NAME, main_model->m_config);
-        main_model->kv_cache = platform->qnn_backend->m_models[main_model->m_config->model_id]->kv_cache.get();
 
         if (args.use_spec) {
+            auto *main_qnn_kv = platform->qnn_backend->get_kv_interface(main_model->m_config->model_id);
+            POWERSERVE_ASSERT(main_qnn_kv != nullptr);
+            main_model->kv_cache = main_qnn_kv;
             qnn_backend->load_model(
                 config.draft_model_dir / powerserve::qnn::QNN_WORKSPACE_DIR_NAME, draft_model->m_config
             );
-            draft_model->kv_cache = platform->qnn_backend->m_models[draft_model->m_config->model_id]->kv_cache.get();
+            draft_model->kv_cache = platform->qnn_backend->get_kv_interface(draft_model->m_config->model_id);
+            POWERSERVE_ASSERT(draft_model->kv_cache != nullptr);
         }
     }
 #endif

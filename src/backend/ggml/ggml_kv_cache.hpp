@@ -98,9 +98,9 @@ public:
 
         ALWAYS_INLINE auto value_entry(KVPosition cache_pos) const -> KVView {
             auto &chk       = chunk.value_buffer[cache_pos.layer_id];
-            auto buffer     = chk.data() + cache_pos.index * parent.m_kv_dim + cache_pos.head_id * parent.m_head_size;
+            auto buffer     = chk.data() + cache_pos.head_id * parent.m_head_size * parent.m_n_ctx + cache_pos.index;
             size_t n_elem   = parent.m_head_size;
-            size_t n_stride = sizeof(float); // TODO: transpose will change stride
+            size_t n_stride = sizeof(float) * parent.m_n_ctx;
 
             return {
                 .n_elements   = n_elem,

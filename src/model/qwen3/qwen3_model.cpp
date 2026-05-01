@@ -15,6 +15,7 @@
 #include "qwen3_model.hpp"
 
 #include "backend/cpu_buffer.hpp"
+#include "core/kv_cache.hpp"
 #include "core/logger.hpp"
 #include "core/perfetto_trace.hpp"
 #include "executor/executor.hpp"
@@ -24,12 +25,61 @@
 #include "sampler/sampler.hpp"
 #include "tokenizer/tokenizer.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <numeric>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace powerserve {
+
+namespace {
+
+inline auto read_kv_scalar(const uint8_t *src, size_t element_size) -> float {
+    if (element_size == sizeof(float)) {
+        return *(const float *)src;
+    }
+    if (element_size == sizeof(ggml_fp16_t)) {
+        return ggml_fp16_to_fp32(*(const ggml_fp16_t *)src);
+    }
+    POWERSERVE_ABORT("unsupported KV element size for reading: {}", element_size);
+    return 0.0f;
+}
+
+inline void write_kv_scalar(uint8_t *dst, size_t element_size, float value) {
+    if (element_size == sizeof(float)) {
+        *(float *)dst = value;
+        return;
+    }
+    if (element_size == sizeof(ggml_fp16_t)) {
+        *(ggml_fp16_t *)dst = ggml_fp32_to_fp16(value);
+        return;
+    }
+    POWERSERVE_ABORT("unsupported KV element size for writing: {}", element_size);
+}
+
+inline void copy_kv_view_with_cast(KVView dst, KVView src, float scale = 1.0f) {
+    POWERSERVE_ASSERT(dst.n_elements == src.n_elements);
+    const bool need_scale = std::fabs(scale - 1.0f) > 1e-8f;
+    if (!need_scale && dst.element_size == src.element_size) {
+        dst.copy_from(src);
+        return;
+    }
+
+    auto *dst_ptr       = (uint8_t *)dst.data;
+    const auto *src_ptr = (const uint8_t *)src.data;
+    for (size_t i = 0; i < dst.n_elements; i++) {
+        float value = read_kv_scalar(src_ptr, src.element_size) * scale;
+        write_kv_scalar(dst_ptr, dst.element_size, value);
+        dst_ptr += dst.stride;
+        src_ptr += src.stride;
+    }
+}
+
+} // namespace
 
 Qwen3Model::Qwen3Model(const std::string &filename, const std::shared_ptr<ModelConfig> &config) : Model(filename) {
     {
@@ -51,6 +101,49 @@ Qwen3Model::~Qwen3Model() {
     gguf_free(gguf_ctx);
 }
 
+#if defined(POWERSERVE_WITH_QNN)
+void Qwen3Model::sync_qnn_kv_to_cpu() {
+    auto *qnn_backend = m_platform->qnn_backend.get();
+    POWERSERVE_ASSERT(qnn_backend != nullptr);
+
+    auto *src_kv = qnn_backend->get_kv_interface(m_config->model_id);
+    POWERSERVE_ASSERT(src_kv != nullptr, "model '{}' not found in qnn backend", m_config->model_id);
+
+    auto *dst_kv = m_platform->ggml_backends.at(m_config->model_id)->m_kv->kv_cache.get();
+    POWERSERVE_ASSERT(dst_kv != nullptr, "model '{}' not found in ggml backend", m_config->model_id);
+
+    POWERSERVE_ASSERT(src_kv->n_layers == dst_kv->n_layers);
+    POWERSERVE_ASSERT(src_kv->n_heads == dst_kv->n_heads);
+    POWERSERVE_ASSERT(src_kv->position <= dst_kv->size);
+    POWERSERVE_ASSERT(dst_kv->position <= src_kv->position);
+
+    const size_t start_index = dst_kv->position;
+    const size_t end_index   = src_kv->position;
+    const float key_rescale  = std::sqrt(static_cast<float>(m_config->llm.head_size));
+
+    for (size_t layer = 0; layer < src_kv->n_layers; layer++) {
+        for (size_t head = 0; head < src_kv->n_heads; head++) {
+            for (size_t cache_index = start_index; cache_index < end_index; cache_index++) {
+                const KVPosition pos{
+                    .layer_id = layer,
+                    .head_id  = head,
+                    .index    = cache_index,
+                };
+                // QNN cache stores scaled keys (multiplied by 1/sqrt(head_size)).
+                // GGML decode applies attention scale during softmax, so recover raw keys here.
+                copy_kv_view_with_cast(dst_kv->key_entry(pos), src_kv->key_entry(pos), key_rescale);
+                copy_kv_view_with_cast(dst_kv->value_entry(pos), src_kv->value_entry(pos));
+            }
+        }
+    }
+
+    const size_t synced_tokens = end_index - start_index;
+    if (synced_tokens > 0) {
+        dst_kv->advance_tokens(synced_tokens);
+    }
+}
+#endif
+
 auto Qwen3Model::forward(
     const std::vector<int> &tokens, const std::vector<int> &pos, const CausalAttentionMask &mask, bool lm_head
 ) -> LogitsVector {
@@ -62,11 +155,30 @@ auto Qwen3Model::forward(
     TensorNode *logits = nullptr;
 
     auto &llm_config = m_config->llm;
+#if defined(POWERSERVE_WITH_QNN)
+    bool use_qnn_backend = false;
+#endif
 
 #if defined(POWERSERVE_WITH_QNN)
-    if (m_platform->qnn_backend) {
+    const bool has_qnn_backend = m_platform->qnn_backend != nullptr;
+    if (has_qnn_backend) {
+        auto *qnn_backend  = m_platform->qnn_backend.get();
+        auto *qnn_model_kv = qnn_backend->get_kv_interface(m_config->model_id);
+        POWERSERVE_ASSERT(qnn_model_kv != nullptr, "model '{}' not found in qnn backend", m_config->model_id);
+
+        const bool decode_step    = lm_head && batch_size == 1;
+        const bool keep_qnn_route = (kv_cache != nullptr && kv_cache == qnn_model_kv);
+        use_qnn_backend           = !decode_step || keep_qnn_route;
+    }
+    if (use_qnn_backend) {
+        auto *qnn_backend = m_platform->qnn_backend.get();
+        auto model_iter   = qnn_backend->m_models.find(m_config->model_id);
+        POWERSERVE_ASSERT(
+            model_iter != qnn_backend->m_models.end(), "model '{}' not found in qnn backend", m_config->model_id
+        );
+
         auto size            = llm_config.dim;
-        bool use_qnn_lm_head = m_platform->qnn_backend->m_models[m_config->model_id]->m_config.lm_heads.size() > 0;
+        bool use_qnn_lm_head = model_iter->second->m_config.lm_heads.size() > 0;
         if (use_qnn_lm_head) {
             size   = llm_config.vocab_size;
             logits = g.qnn_forward(x, pos, mask, size, lm_head);
@@ -82,24 +194,23 @@ auto Qwen3Model::forward(
     } else
 #endif
     {
-        if (!lazy_load) {
-            m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
-            for (size_t L = 0; L < llm_config.n_layers; L++) {
-                auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
-                /* lsh 修改起始 */
-                bool is_need_bias = false;
-                /* lsh 修改结束 */
-                auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, is_need_bias); //Qwen2最后一个参数硬编码为True，要求使用bias
-                auto ffn_o = m_ffn->build(g, att_o, L);
-                x          = ffn_o;
-            }
-            // TODO: cpu and qnn reuse
-            if (lm_head) {
-                auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
-                auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
-                auto output_w       = g.add_tensor(m_weights->output_weight);
-                logits              = g.mat_mul(output_w, final_rms_norm);
-            }
+        POWERSERVE_ASSERT(!lazy_load, "Qwen3 CPU decode requires full GGUF weights (lazy_load=false)");
+        m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
+        for (size_t L = 0; L < llm_config.n_layers; L++) {
+            auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+            /* lsh 修改起始 */
+            bool is_need_bias = false;
+            /* lsh 修改结束 */
+            auto att_o = m_attn->build(g, x, L, g.add_tensor(k_cache), g.add_tensor(v_cache), pos, mask, is_need_bias); //Qwen2最后一个参数硬编码为True，要求使用bias
+            auto ffn_o = m_ffn->build(g, att_o, L);
+            x          = ffn_o;
+        }
+        // TODO: cpu and qnn reuse
+        if (lm_head) {
+            auto rms_final_w    = g.add_tensor(m_weights->rms_final_weight);
+            auto final_rms_norm = g.rms_norm(x, rms_final_w, llm_config.norm_eps);
+            auto output_w       = g.add_tensor(m_weights->output_weight);
+            logits              = g.mat_mul(output_w, final_rms_norm);
         }
     }
 
@@ -108,7 +219,9 @@ auto Qwen3Model::forward(
 
     executor.run();
 #if defined(POWERSERVE_WITH_QNN)
-    if (!m_platform->qnn_backend)
+    if (use_qnn_backend) {
+        sync_qnn_kv_to_cpu();
+    } else
 #endif
     {
         m_platform->ggml_backends[m_config->model_id]->m_kv->advance(batch_size);
@@ -328,9 +441,7 @@ auto Qwen3Model::compute_rerank_score(const std::vector<Token> &tokens, size_t b
         // 4. Execution
         Executor executor(*m_platform, g);
         executor.allocate_buffers();
-        POWERSERVE_LOG_INFO("Rerank: Executing batch of size {}", current_bs);
         executor.run();
-        POWERSERVE_LOG_INFO("Rerank: Execution complete for batch size {}", current_bs);
 
 #if defined(POWERSERVE_WITH_QNN)
         if (!m_platform->qnn_backend)
