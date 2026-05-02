@@ -15,7 +15,6 @@ tools/llama_tf_to_qnn_bin
 tools/process_image
 *.log
 CMakeFiles/cmake.check_cache
-third_party/android/arm64-v8a/libOpenCL.so
 libs/xtl
 libs/xtensor
 libs/libuv
@@ -43,3 +42,7 @@ backend_eval_outputs.txt
 backend_eval_report.json
 topk_eval_outputs.txt
 topk_eval_report.json
+prompts.txt
+report_dense1.txt
+report-2048cache.txt
+report-baseline.txt

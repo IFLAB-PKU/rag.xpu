@@ -29,7 +29,7 @@ fi
 cd /code
 
 echo -e "\033[32mCreating build directory for Android\033[0m"
-cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-34 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF -DPOWERSERVE_WITH_QNN=OFF -DPOWERSERVE_ENABLE_HTPRPCPOLL=OFF -DPOWERSERVE_ENABLE_HMXPWRCFG=OFF -DPOWERSERVE_USE_DUMMY=ON -DPOWERSERVE_WITH_OPENCL=ON -DPOWERSERVE_OPENCL_EMBED_KERNELS=ON -DPOWERSERVE_ANDROID_OPENCL_LIB=/code/third_party/android/arm64-v8a/libOpenCL.so -DOpenCL_LIBRARY=/code/third_party/android/arm64-v8a/libOpenCL.so -DOpenCL_INCLUDE_DIR=/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include -S . -B build_android
+cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-34 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_SHARED_LIBS=OFF -DGGML_OPENMP=OFF -DPOWERSERVE_WITH_QNN=OFF -DPOWERSERVE_ENABLE_HTPRPCPOLL=OFF -DPOWERSERVE_ENABLE_HMXPWRCFG=OFF -DPOWERSERVE_USE_DUMMY=ON -DPOWERSERVE_WITH_OPENCL=OFF -DPOWERSERVE_OPENCL_EMBED_KERNELS=OFF -DPOWERSERVE_ANDROID_OPENCL_LIB=/code/third_party/android/arm64-v8a/libOpenCL.so -DOpenCL_LIBRARY=/code/third_party/android/arm64-v8a/libOpenCL.so -DOpenCL_INCLUDE_DIR=/ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include -S . -B build_android
 
 echo -e "\033[32mBuilding project for Android\033[0m"
 cmake --build build_android --config RelWithDebInfo --parallel 12 --target all
