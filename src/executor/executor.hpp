@@ -16,8 +16,11 @@
 
 #include "backend/platform.hpp"
 #include "graph/graph.hpp"
-#include "backend/opencl/opencl_buffer.hpp"  
+
+#if defined(POWERSERVE_WITH_OPENCL)
+#include "backend/opencl/opencl_buffer.hpp"
 #include "backend/opencl/opencl_backend.hpp"
+#endif
 
 #include <functional>
 
@@ -48,6 +51,7 @@ private:
     }
 
     // ziqian：增加OpenCL buffer创建
+#if defined(POWERSERVE_WITH_OPENCL)
     template <typename T>
     void create_opencl_buffer_for_tensor(Tensor* tensor) {
         POWERSERVE_ASSERT(tensor != nullptr);
@@ -69,6 +73,7 @@ private:
         POWERSERVE_ASSERT(tensor->type != NodeType::TENSOR_VIEW);
         create_opencl_buffer_for_tensor<T>(tensor.get());
     }
+#endif
     // ziqian：end
 };
 

@@ -70,24 +70,33 @@ void Platform::reset_kv_position(std::string &model_id) {
 }
 
 bool Platform::using_opencl(const std::string& model_id) const {
+#if defined(POWERSERVE_WITH_OPENCL)
     return opencl_backends.find(model_id) != opencl_backends.end();
+#else
+    (void)model_id;
+    return false;
+#endif
 }
 
 Backend* Platform::get_backend(const std::string& model_id) {
+#if defined(POWERSERVE_WITH_OPENCL)
     auto it_cl = opencl_backends.find(model_id);
     if (it_cl != opencl_backends.end()) {
         return it_cl->second.get();
     }
+#endif
     auto it_gg = ggml_backends.find(model_id);
     POWERSERVE_ASSERT(it_gg != ggml_backends.end());
     return it_gg->second.get();
 }
 
 const Backend* Platform::get_backend(const std::string& model_id) const {
+#if defined(POWERSERVE_WITH_OPENCL)
     auto it_cl = opencl_backends.find(model_id);
     if (it_cl != opencl_backends.end()) {
         return it_cl->second.get();
     }
+#endif
     auto it_gg = ggml_backends.find(model_id);
     POWERSERVE_ASSERT(it_gg != ggml_backends.end());
     return it_gg->second.get();

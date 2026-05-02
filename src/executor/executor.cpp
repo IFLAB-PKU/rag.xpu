@@ -28,6 +28,7 @@
 
 namespace powerserve {
 
+#if defined(POWERSERVE_WITH_OPENCL)
 static inline bool force_get_mask_cpu_fallback() {
     static int cached = -1;
     if (cached >= 0) {
@@ -43,6 +44,7 @@ static inline bool force_get_mask_cpu_fallback() {
     )) ? 1 : 0;
     return cached == 1;
 }
+#endif
 
 // ziqian add: debug hook impl and other debug tools
 // ===== Debug hook impl =====
@@ -123,6 +125,7 @@ static uint64_t hash_ops_signature(const std::vector<std::shared_ptr<powerserve:
 
 // ziqian：增加通过后端决定分配buffer类型
 void Executor::allocate_buffers() {
+#if defined(POWERSERVE_WITH_OPENCL)
     const bool use_opencl = m_platform.using_opencl(m_graph.m_model_id);
 
     powerserve::opencl::OpenCLBackend* cl_backend = nullptr;
@@ -141,11 +144,15 @@ void Executor::allocate_buffers() {
             }
         }
     }
+#else
+    constexpr bool use_opencl = false;
+#endif
 
     for (auto &node : m_graph.tensors) {
         auto tensor = node->tensor();
         if (!tensor) continue;
 
+#if defined(POWERSERVE_WITH_OPENCL)
         if (use_opencl && node->type == NodeType::TENSOR_VIEW) {
             // 1) VIEW op 的输出：run() 里会按 (stride, offset) 物化 OpenCL view（避免重复）
             if (view_op_outputs.count(tensor) > 0) {
@@ -188,6 +195,7 @@ void Executor::allocate_buffers() {
             tensor->m_data = std::static_pointer_cast<BaseBuffer>(view_buf);
             continue;
         }
+#endif
 
         // ----------------------------
         // Case 1: tensor already has buffer
@@ -197,6 +205,7 @@ void Executor::allocate_buffers() {
                 continue; // CPU backend no-op
             }
 
+#if defined(POWERSERVE_WITH_OPENCL)
             // already OpenCLBuffer -> skip
             {
                 auto &base = tensor->get<BaseBuffer>();
@@ -232,6 +241,7 @@ void Executor::allocate_buffers() {
 
                 continue;
             }
+#endif
         }
 
         // ----------------------------
@@ -239,24 +249,44 @@ void Executor::allocate_buffers() {
         // ----------------------------
         switch (tensor->m_dtype) {
         case DataType::FP32:
+#if defined(POWERSERVE_WITH_OPENCL)
             if (use_opencl) create_opencl_buffer<float>(node);
             else            create_cpu_buffer<float>(node);
+#else
+            create_cpu_buffer<float>(node);
+#endif
             break;
         case DataType::FP16:
+#if defined(POWERSERVE_WITH_OPENCL)
             if (use_opencl) create_opencl_buffer<uint16_t>(node);
             else            create_cpu_buffer<uint16_t>(node);
+#else
+            create_cpu_buffer<uint16_t>(node);
+#endif
             break;
         case DataType::INT32:
+#if defined(POWERSERVE_WITH_OPENCL)
             if (use_opencl) create_opencl_buffer<int32_t>(node);
             else            create_cpu_buffer<int32_t>(node);
+#else
+            create_cpu_buffer<int32_t>(node);
+#endif
             break;
         case DataType::GGML_Q4_0:
+#if defined(POWERSERVE_WITH_OPENCL)
             if (use_opencl) create_opencl_buffer<uint8_t>(node);
             else            POWERSERVE_ABORT("allocate_buffers: quant dtype on CPU path requires preloaded ggml buffer");
+#else
+            POWERSERVE_ABORT("allocate_buffers: quant dtype on CPU path requires preloaded ggml buffer");
+#endif
             break;
         case DataType::GGML_Q8_0:
+#if defined(POWERSERVE_WITH_OPENCL)
             if (use_opencl) create_opencl_buffer<uint8_t>(node);
             else            POWERSERVE_ABORT("allocate_buffers: quant dtype on CPU path requires preloaded ggml buffer");
+#else
+            POWERSERVE_ABORT("allocate_buffers: quant dtype on CPU path requires preloaded ggml buffer");
+#endif
             break;
         default:
             POWERSERVE_ABORT("allocate_buffers: unsupported dtype");
@@ -305,7 +335,11 @@ void Executor::run() {
     auto &model_id = m_graph.m_model_id;
     auto *backend = m_platform.get_backend(model_id);
     POWERSERVE_ASSERT(backend != nullptr);
+#if defined(POWERSERVE_WITH_OPENCL)
     const bool use_opencl = m_platform.using_opencl(model_id);
+#else
+    constexpr bool use_opencl = false;
+#endif
     plan();
 
     int op_idx = 0;
@@ -430,6 +464,7 @@ void Executor::run() {
             POWERSERVE_ASSERT(src && "TensorViewNode parent is null");
             auto [stride, offset] = op->get_params<ViewParams>();
 
+#if defined(POWERSERVE_WITH_OPENCL)
             if (use_opencl) {
                 // OpenCL: materialize view as sub-buffer
                 auto &parent = src->get<powerserve::opencl::OpenCLBuffer>();
@@ -459,6 +494,7 @@ void Executor::run() {
                 out->get<powerserve::opencl::OpenCLBuffer>().m_stride = stride;
                 break;
             }
+#endif
 
             // CPU behavior unchanged
             out->get<CPUBuffer>().m_stride = stride;
@@ -495,6 +531,7 @@ void Executor::run() {
                 break;
             }
 
+#if defined(POWERSERVE_WITH_OPENCL)
             auto *cl_backend = dynamic_cast<powerserve::opencl::OpenCLBackend *>(backend);
             POWERSERVE_ASSERT(cl_backend && "backend is not OpenCLBackend while use_opencl=true");
 
@@ -517,6 +554,7 @@ void Executor::run() {
 
             // ===== OpenCL GPU path =====
             cl_backend->get_mask(out, pos);
+#endif
 
         } break;
 

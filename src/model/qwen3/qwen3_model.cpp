@@ -36,23 +36,31 @@ namespace powerserve {
 
 namespace {
 
+#if defined(POWERSERVE_WITH_OPENCL)
 auto qwen3_using_opencl(const Platform &platform, const std::string &model_id) -> bool {
     return platform.using_opencl(model_id);
 }
+#endif
 
 void qwen3_reset_kv_batch_size(Platform &platform, const std::string &model_id, size_t batch_size) {
+#if defined(POWERSERVE_WITH_OPENCL)
     if (qwen3_using_opencl(platform, model_id)) {
         platform.opencl_backends[model_id]->reset_kv_batch_size(batch_size);
     } else {
         platform.ggml_backends[model_id]->reset_kv_batch_size(batch_size);
     }
+#else
+    platform.ggml_backends[model_id]->reset_kv_batch_size(batch_size);
+#endif
 }
 
 auto qwen3_get_cache_tensors(Platform &platform, const std::string &model_id, size_t layer)
     -> std::pair<Tensor, Tensor> {
+#if defined(POWERSERVE_WITH_OPENCL)
     if (qwen3_using_opencl(platform, model_id)) {
         return platform.opencl_backends[model_id]->get_cache_tensors(layer);
     }
+#endif
     return platform.ggml_backends[model_id]->m_kv->get_cache(layer);
 }
 
