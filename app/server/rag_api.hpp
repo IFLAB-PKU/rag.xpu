@@ -37,6 +37,7 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
     rag_request.generation_prefill_backend = request.value("generation_prefill_backend", std::string{"auto"});
     rag_request.generation_decode_backend = request.value("generation_decode_backend", std::string{"auto"});
     rag_request.temperature = request.value("temperature", 0.2F);
+    rag_request.enable_pd_orchestrator = request.value("enable_pd_orchestrator", false);
 
     rag_request.generation_model = request.value("generation_model", request.value("model", std::string{}));
     rag_request.embedding_model = request.value("embedding_model", std::string{});

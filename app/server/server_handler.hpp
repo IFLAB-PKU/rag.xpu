@@ -1297,6 +1297,9 @@ struct PDOrchestratorTask {
     const ModelContext *context = nullptr;
     const ModelInput *input     = nullptr;
     std::string input_prompt;
+    std::vector<std::string> input_segments;
+    GenerationDecodeTask decode_task;
+    std::chrono::steady_clock::time_point enqueued_at;
     std::unique_ptr<powerserve::SamplerChain> sampler_ptr;
     std::optional<BlockingPrefillResult> prefill_result;
     std::shared_ptr<std::mutex> model_exec_mutex;
@@ -1420,6 +1423,7 @@ public:
             .context      = &context,
             .input        = &input,
             .input_prompt = input_prompt,
+            .enqueued_at  = std::chrono::steady_clock::now(),
         };
         std::future<ModelOutput> result_future = task.result_promise.get_future();
 
@@ -1431,6 +1435,41 @@ public:
         m_prefill_cv.notify_one();
 
         return result_future.get();
+    }
+
+    GenerationDecodeCandidate run_segmented_task(
+        const ModelContext &context,
+        const ModelInput &input,
+        const GenerationDecodeTask &decode_task
+    ) {
+        PDOrchestratorTask task{
+            .context        = &context,
+            .input          = &input,
+            .input_segments = decode_task.input_segments,
+            .decode_task    = decode_task,
+            .enqueued_at    = std::chrono::steady_clock::now(),
+        };
+        std::future<ModelOutput> result_future = task.result_promise.get_future();
+
+        {
+            std::lock_guard<std::mutex> lock_guard(m_lock);
+            m_prefill_queue.push_back(std::move(task));
+        }
+        POWERSERVE_LOG_INFO("pd orchestrator: segmented request {} queued to prefill", input.request_id);
+        m_prefill_cv.notify_one();
+
+        const auto result_start = std::chrono::steady_clock::now();
+        ModelOutput output = result_future.get();
+        const size_t total_wait_ms = static_cast<size_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(result_start - task.enqueued_at).count()
+        );
+        (void)total_wait_ms;
+
+        return {
+            .source = decode_task.query_type,
+            .output = std::move(output),
+            .queue_wait_ms = 0,
+        };
     }
 
 private:
@@ -1491,12 +1530,21 @@ private:
                 }
 
                 POWERSERVE_LOG_INFO("pd orchestrator: prefill request {} start", input.request_id);
-                task.prefill_result = m_prefill_executor.run_prefill(
-                    context,
-                    input,
-                    task.input_prompt,
-                    *task.sampler_ptr
-                );
+                if (!task.input_segments.empty()) {
+                    task.prefill_result = m_prefill_executor.run_prefill_segmented(
+                        context,
+                        input,
+                        task.input_segments,
+                        *task.sampler_ptr
+                    );
+                } else {
+                    task.prefill_result = m_prefill_executor.run_prefill(
+                        context,
+                        input,
+                        task.input_prompt,
+                        *task.sampler_ptr
+                    );
+                }
 
                 {
                     std::lock_guard<std::mutex> lock_guard(m_lock);
@@ -1545,11 +1593,22 @@ private:
                 }
 
                 POWERSERVE_LOG_INFO("pd orchestrator: decode request {} start", input.request_id);
-                ModelOutput output = m_decode_executor.run_decode(
-                    input,
-                    tokenizer,
-                    task.prefill_result.value()
-                );
+                ModelOutput output;
+                if (task.decode_task.max_decode_steps > 0) {
+                    output = m_decode_executor.run_decode_steps(
+                        input,
+                        tokenizer,
+                        task.prefill_result.value(),
+                        task.decode_task.max_decode_steps,
+                        true
+                    );
+                } else {
+                    output = m_decode_executor.run_decode(
+                        input,
+                        tokenizer,
+                        task.prefill_result.value()
+                    );
+                }
                 task.result_promise.set_value(std::move(output));
             } catch (...) {
                 task.result_promise.set_exception(std::current_exception());
