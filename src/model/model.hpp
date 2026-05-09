@@ -103,6 +103,7 @@ public:
     std::shared_ptr<FFN> m_ffn;
     std::shared_ptr<Platform> m_platform;
     KVCacheInterface *kv_cache = nullptr;
+    void *ggml_kv_override = nullptr;  // points to powerserve::ggml::GGMLKV for private decode
 
 public:
     Model(const std::string &filename) :
@@ -234,9 +235,14 @@ public:
     virtual void decode() override {
         if (n_rest > 0 && m_tokens.size() >= 1) {
             if (m_tokens.size() == 1) {
-                auto &platform   = m_model.m_platform;
-                auto current_pos = platform->get_kv_position(m_model.m_config->model_id);
-                std::vector<int> pos(1, current_pos);
+                size_t current_pos = 0;
+                if (m_model.kv_cache != nullptr) {
+                    current_pos = m_model.kv_cache->position;
+                } else {
+                    auto &platform = m_model.m_platform;
+                    current_pos    = platform->get_kv_position(m_model.m_config->model_id);
+                }
+                std::vector<int> pos(1, static_cast<int>(current_pos));
                 std::vector<int> token(1, m_tokens.front());
                 auto ret = m_model.decode(m_sampler, token, pos, true);
                 std::copy(ret.begin(), ret.end(), std::back_inserter(m_tokens));

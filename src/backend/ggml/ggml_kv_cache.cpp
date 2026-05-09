@@ -68,4 +68,32 @@ void GGMLKV::prepare_model_chunk() {
     attn_bias.reserve(m_batch_size * m_n_ctx);
 }
 
+auto GGMLKV::save_snapshot() const -> std::unique_ptr<Snapshot> {
+    auto snapshot = std::make_unique<Snapshot>();
+    snapshot->position = kv_cache->position;
+    snapshot->key_buffer.resize(m_n_layers);
+    snapshot->value_buffer.resize(m_n_layers);
+    size_t layer_size = m_kv_dim * m_n_ctx;
+    for (size_t L = 0; L < m_n_layers; L++) {
+        snapshot->key_buffer[L].resize(layer_size);
+        snapshot->value_buffer[L].resize(layer_size);
+        std::memcpy(snapshot->key_buffer[L].data(), chunk.key_buffer[L].data(), layer_size * sizeof(float));
+        std::memcpy(snapshot->value_buffer[L].data(), chunk.value_buffer[L].data(), layer_size * sizeof(float));
+    }
+    return snapshot;
+}
+
+void GGMLKV::restore_snapshot(const Snapshot &snapshot) {
+    POWERSERVE_ASSERT(snapshot.key_buffer.size() == m_n_layers);
+    POWERSERVE_ASSERT(snapshot.value_buffer.size() == m_n_layers);
+    size_t layer_size = m_kv_dim * m_n_ctx;
+    for (size_t L = 0; L < m_n_layers; L++) {
+        POWERSERVE_ASSERT(snapshot.key_buffer[L].size() == layer_size);
+        POWERSERVE_ASSERT(snapshot.value_buffer[L].size() == layer_size);
+        std::memcpy(chunk.key_buffer[L].data(), snapshot.key_buffer[L].data(), layer_size * sizeof(float));
+        std::memcpy(chunk.value_buffer[L].data(), snapshot.value_buffer[L].data(), layer_size * sizeof(float));
+    }
+    kv_cache->position = snapshot.position;
+}
+
 } // namespace powerserve::ggml

@@ -1304,6 +1304,7 @@ struct PDOrchestratorTask {
     std::optional<BlockingPrefillResult> prefill_result;
     std::shared_ptr<std::mutex> model_exec_mutex;
     std::unique_lock<std::mutex> model_exec_lock;
+    std::unique_ptr<powerserve::ggml::GGMLKV> private_ggml_kv;
     std::promise<ModelOutput> result_promise;
 };
 
@@ -1546,6 +1547,25 @@ private:
                     );
                 }
 
+                // Snapshot shared GGML KV into a private copy so decode can run
+                // concurrently with the next task's NPU prefill
+                {
+                    auto ggml_iter = context.m_model_ptr->m_platform->ggml_backends.find(
+                        context.m_model_ptr->m_config->model_id
+                    );
+                    POWERSERVE_ASSERT(ggml_iter != context.m_model_ptr->m_platform->ggml_backends.end());
+                    POWERSERVE_ASSERT(ggml_iter->second && ggml_iter->second->m_kv);
+
+                    auto snapshot = ggml_iter->second->m_kv->save_snapshot();
+                    task.private_ggml_kv = std::make_unique<powerserve::ggml::GGMLKV>(
+                        ggml_iter->second->m_kv->m_config
+                    );
+                    task.private_ggml_kv->restore_snapshot(*snapshot);
+                }
+
+                // Release model lock so next prefill can start immediately
+                task.model_exec_lock.unlock();
+
                 {
                     std::lock_guard<std::mutex> lock_guard(m_lock);
                     m_decode_queue.push_back(std::move(task));
@@ -1576,21 +1596,26 @@ private:
                 POWERSERVE_ASSERT(task.input != nullptr);
                 POWERSERVE_ASSERT(task.sampler_ptr != nullptr);
                 POWERSERVE_ASSERT(task.prefill_result.has_value());
+                POWERSERVE_ASSERT(task.private_ggml_kv != nullptr);
 
                 const auto &context   = *task.context;
                 const auto &input     = *task.input;
                 const auto &tokenizer = *context.m_tokenizer_ptr;
 
-                if (input.m_generation_route_enabled) {
-                    if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
-                        POWERSERVE_LOG_WARN(
-                            "orchestrator decode backend route fallback to cpu, request_id={}, target={}",
-                            input.request_id,
-                            input.m_generation_decode_backend_target
-                        );
-                        (void)set_generation_backend_route(context, "cpu");
+                // Use private GGML KV for decode so the next prefill can run
+                // on NPU in parallel without overwriting shared CPU KV buffers.
+                context.m_model_ptr->kv_cache = task.private_ggml_kv->kv_cache.get();
+                context.m_model_ptr->ggml_kv_override = task.private_ggml_kv.get();
+
+                struct GgmlKvOverrideGuard {
+                    powerserve::Model *model;
+                    ~GgmlKvOverrideGuard() {
+                        if (model != nullptr) {
+                            model->ggml_kv_override = nullptr;
+                        }
                     }
-                }
+                } override_guard{context.m_model_ptr.get()};
+                (void)override_guard;
 
                 POWERSERVE_LOG_INFO("pd orchestrator: decode request {} start", input.request_id);
                 ModelOutput output;
