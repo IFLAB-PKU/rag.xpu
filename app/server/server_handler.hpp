@@ -1548,8 +1548,11 @@ private:
                 }
 
                 // Snapshot shared GGML KV into a private copy so decode can run
-                // concurrently with the next task's NPU prefill
-                {
+                // concurrently with the next task's NPU prefill.
+                // Only do this for segmented generation tasks (run_segmented_task);
+                // simple prompt tasks (run_single_prompt) keep the Phase 1 behavior
+                // to avoid snapshot overhead on short queries like query expansion.
+                if (!task.input_segments.empty()) {
                     auto ggml_iter = context.m_model_ptr->m_platform->ggml_backends.find(
                         context.m_model_ptr->m_config->model_id
                     );
@@ -1561,10 +1564,10 @@ private:
                         ggml_iter->second->m_kv->m_config
                     );
                     task.private_ggml_kv->restore_snapshot(*snapshot);
-                }
 
-                // Release model lock so next prefill can start immediately
-                task.model_exec_lock.unlock();
+                    // Release model lock so next prefill can start immediately
+                    task.model_exec_lock.unlock();
+                }
 
                 {
                     std::lock_guard<std::mutex> lock_guard(m_lock);
@@ -1596,26 +1599,39 @@ private:
                 POWERSERVE_ASSERT(task.input != nullptr);
                 POWERSERVE_ASSERT(task.sampler_ptr != nullptr);
                 POWERSERVE_ASSERT(task.prefill_result.has_value());
-                POWERSERVE_ASSERT(task.private_ggml_kv != nullptr);
 
                 const auto &context   = *task.context;
                 const auto &input     = *task.input;
                 const auto &tokenizer = *context.m_tokenizer_ptr;
 
-                // Use private GGML KV for decode so the next prefill can run
-                // on NPU in parallel without overwriting shared CPU KV buffers.
-                context.m_model_ptr->kv_cache = task.private_ggml_kv->kv_cache.get();
-                context.m_model_ptr->ggml_kv_override = task.private_ggml_kv.get();
+                if (task.private_ggml_kv != nullptr) {
+                    // Phase 2 path: use private GGML KV for true PD overlap
+                    context.m_model_ptr->kv_cache = task.private_ggml_kv->kv_cache.get();
+                    context.m_model_ptr->ggml_kv_override = task.private_ggml_kv.get();
 
-                struct GgmlKvOverrideGuard {
-                    powerserve::Model *model;
-                    ~GgmlKvOverrideGuard() {
-                        if (model != nullptr) {
-                            model->ggml_kv_override = nullptr;
+                    struct GgmlKvOverrideGuard {
+                        powerserve::Model *model;
+                        ~GgmlKvOverrideGuard() {
+                            if (model != nullptr) {
+                                model->ggml_kv_override = nullptr;
+                            }
+                        }
+                    } override_guard{context.m_model_ptr.get()};
+                    (void)override_guard;
+                } else {
+                    // Phase 1 path: simple prompt tasks (e.g. query expansion)
+                    // keep the model lock across prefill+decode, use shared KV
+                    if (input.m_generation_route_enabled) {
+                        if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
+                            POWERSERVE_LOG_WARN(
+                                "orchestrator decode backend route fallback to cpu, request_id={}, target={}",
+                                input.request_id,
+                                input.m_generation_decode_backend_target
+                            );
+                            (void)set_generation_backend_route(context, "cpu");
                         }
                     }
-                } override_guard{context.m_model_ptr.get()};
-                (void)override_guard;
+                }
 
                 POWERSERVE_LOG_INFO("pd orchestrator: decode request {} start", input.request_id);
                 ModelOutput output;
