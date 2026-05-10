@@ -329,14 +329,11 @@ public:
 
 public:
     ModelContext &setup_model_for_blocking_pd(const ModelInput &input) {
-        constexpr size_t PD_SLOT_COUNT = 2;
-        const std::string slot_model_name =
-            input.m_model + std::string(PD_SLOT_TAG) + std::to_string(input.request_id % PD_SLOT_COUNT);
-        return setup_model(slot_model_name);
+        return setup_model(input.m_model);
     }
 
     ModelContext &setup_model(const std::string &model_name) {
-        const std::string resolved_model_name = strip_pd_slot_suffix(model_name);
+        const std::string &resolved_model_name = model_name;
 
         // Parse model name
         std::string_view main_model_name;
@@ -479,20 +476,6 @@ public:
     }
 
 private:
-    static constexpr const char *PD_SLOT_TAG = "@pdslot";
-
-    static bool is_pd_slot_model_name(const std::string &model_name) {
-        return model_name.find(PD_SLOT_TAG) != std::string::npos;
-    }
-
-    static std::string strip_pd_slot_suffix(const std::string &model_name) {
-        const auto pos = model_name.find(PD_SLOT_TAG);
-        if (pos == std::string::npos) {
-            return model_name;
-        }
-        return model_name.substr(0, pos);
-    }
-
     powerserve::Path model_name_to_path(const std::string_view model_name) const {
         const powerserve::Path inner_model_folder = m_work_folder / model_name;
         powerserve::Path model_folder;
@@ -518,17 +501,6 @@ private:
         }
 
         std::shared_ptr<powerserve::Model> model_ptr = powerserve::load_model(model_path);
-
-        const auto slot_pos = instance_key.find(PD_SLOT_TAG);
-        if (slot_pos != std::string::npos) {
-            const auto slot_suffix = instance_key.substr(slot_pos);
-            // Keep original ModelConfig object alive because model modules
-            // store references to m_config->llm fields.
-            model_ptr->m_config->model_id = model_ptr->m_config->model_id + slot_suffix;
-            if (!model_ptr->m_config->vision.model_id.empty()) {
-                model_ptr->m_config->vision.model_id = model_ptr->m_config->model_id;
-            }
-        }
 
         model_ptr->m_platform = m_platform_ptr;
         m_platform_ptr->init_ggml_backend(model_ptr->m_config, hyper_params);
