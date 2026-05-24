@@ -158,6 +158,16 @@ public:
         return {chunk.key_tensors[L], chunk.value_tensors[L]};
     }
 
+public:
+    struct Snapshot {
+        size_t position = 0;
+        KVBuffer key_buffer;
+        KVBuffer value_buffer;
+    };
+
+    auto save_snapshot() const -> std::unique_ptr<Snapshot>;
+    void restore_snapshot(const Snapshot &snapshot);
+
 private:
     void prepare_model_chunk();
 };

@@ -329,14 +329,11 @@ public:
 
 public:
     ModelContext &setup_model_for_blocking_pd(const ModelInput &input) {
-        constexpr size_t PD_SLOT_COUNT = 2;
-        const std::string slot_model_name =
-            input.m_model + std::string(PD_SLOT_TAG) + std::to_string(input.request_id % PD_SLOT_COUNT);
-        return setup_model(slot_model_name);
+        return setup_model(input.m_model);
     }
 
     ModelContext &setup_model(const std::string &model_name) {
-        const std::string resolved_model_name = strip_pd_slot_suffix(model_name);
+        const std::string &resolved_model_name = model_name;
 
         // Parse model name
         std::string_view main_model_name;
@@ -479,20 +476,6 @@ public:
     }
 
 private:
-    static constexpr const char *PD_SLOT_TAG = "@pdslot";
-
-    static bool is_pd_slot_model_name(const std::string &model_name) {
-        return model_name.find(PD_SLOT_TAG) != std::string::npos;
-    }
-
-    static std::string strip_pd_slot_suffix(const std::string &model_name) {
-        const auto pos = model_name.find(PD_SLOT_TAG);
-        if (pos == std::string::npos) {
-            return model_name;
-        }
-        return model_name.substr(0, pos);
-    }
-
     powerserve::Path model_name_to_path(const std::string_view model_name) const {
         const powerserve::Path inner_model_folder = m_work_folder / model_name;
         powerserve::Path model_folder;
@@ -518,17 +501,6 @@ private:
         }
 
         std::shared_ptr<powerserve::Model> model_ptr = powerserve::load_model(model_path);
-
-        const auto slot_pos = instance_key.find(PD_SLOT_TAG);
-        if (slot_pos != std::string::npos) {
-            const auto slot_suffix = instance_key.substr(slot_pos);
-            // Keep original ModelConfig object alive because model modules
-            // store references to m_config->llm fields.
-            model_ptr->m_config->model_id = model_ptr->m_config->model_id + slot_suffix;
-            if (!model_ptr->m_config->vision.model_id.empty()) {
-                model_ptr->m_config->vision.model_id = model_ptr->m_config->model_id;
-            }
-        }
 
         model_ptr->m_platform = m_platform_ptr;
         m_platform_ptr->init_ggml_backend(model_ptr->m_config, hyper_params);
@@ -1297,10 +1269,14 @@ struct PDOrchestratorTask {
     const ModelContext *context = nullptr;
     const ModelInput *input     = nullptr;
     std::string input_prompt;
+    std::vector<std::string> input_segments;
+    GenerationDecodeTask decode_task;
+    std::chrono::steady_clock::time_point enqueued_at;
     std::unique_ptr<powerserve::SamplerChain> sampler_ptr;
     std::optional<BlockingPrefillResult> prefill_result;
     std::shared_ptr<std::mutex> model_exec_mutex;
     std::unique_lock<std::mutex> model_exec_lock;
+    std::unique_ptr<powerserve::ggml::GGMLKV> private_ggml_kv;
     std::promise<ModelOutput> result_promise;
 };
 
@@ -1420,6 +1396,7 @@ public:
             .context      = &context,
             .input        = &input,
             .input_prompt = input_prompt,
+            .enqueued_at  = std::chrono::steady_clock::now(),
         };
         std::future<ModelOutput> result_future = task.result_promise.get_future();
 
@@ -1431,6 +1408,41 @@ public:
         m_prefill_cv.notify_one();
 
         return result_future.get();
+    }
+
+    GenerationDecodeCandidate run_segmented_task(
+        const ModelContext &context,
+        const ModelInput &input,
+        const GenerationDecodeTask &decode_task
+    ) {
+        PDOrchestratorTask task{
+            .context        = &context,
+            .input          = &input,
+            .input_segments = decode_task.input_segments,
+            .decode_task    = decode_task,
+            .enqueued_at    = std::chrono::steady_clock::now(),
+        };
+        std::future<ModelOutput> result_future = task.result_promise.get_future();
+
+        {
+            std::lock_guard<std::mutex> lock_guard(m_lock);
+            m_prefill_queue.push_back(std::move(task));
+        }
+        POWERSERVE_LOG_INFO("pd orchestrator: segmented request {} queued to prefill", input.request_id);
+        m_prefill_cv.notify_one();
+
+        const auto result_start = std::chrono::steady_clock::now();
+        ModelOutput output = result_future.get();
+        const size_t total_wait_ms = static_cast<size_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(result_start - task.enqueued_at).count()
+        );
+        (void)total_wait_ms;
+
+        return {
+            .source = decode_task.query_type,
+            .output = std::move(output),
+            .queue_wait_ms = 0,
+        };
     }
 
 private:
@@ -1491,12 +1503,43 @@ private:
                 }
 
                 POWERSERVE_LOG_INFO("pd orchestrator: prefill request {} start", input.request_id);
-                task.prefill_result = m_prefill_executor.run_prefill(
-                    context,
-                    input,
-                    task.input_prompt,
-                    *task.sampler_ptr
-                );
+                if (!task.input_segments.empty()) {
+                    task.prefill_result = m_prefill_executor.run_prefill_segmented(
+                        context,
+                        input,
+                        task.input_segments,
+                        *task.sampler_ptr
+                    );
+                } else {
+                    task.prefill_result = m_prefill_executor.run_prefill(
+                        context,
+                        input,
+                        task.input_prompt,
+                        *task.sampler_ptr
+                    );
+                }
+
+                // Snapshot shared GGML KV into a private copy so decode can run
+                // concurrently with the next task's NPU prefill.
+                // Only do this for segmented generation tasks (run_segmented_task);
+                // simple prompt tasks (run_single_prompt) keep the Phase 1 behavior
+                // to avoid snapshot overhead on short queries like query expansion.
+                if (!task.input_segments.empty()) {
+                    auto ggml_iter = context.m_model_ptr->m_platform->ggml_backends.find(
+                        context.m_model_ptr->m_config->model_id
+                    );
+                    POWERSERVE_ASSERT(ggml_iter != context.m_model_ptr->m_platform->ggml_backends.end());
+                    POWERSERVE_ASSERT(ggml_iter->second && ggml_iter->second->m_kv);
+
+                    auto snapshot = ggml_iter->second->m_kv->save_snapshot();
+                    task.private_ggml_kv = std::make_unique<powerserve::ggml::GGMLKV>(
+                        ggml_iter->second->m_kv->m_config
+                    );
+                    task.private_ggml_kv->restore_snapshot(*snapshot);
+
+                    // Release model lock so next prefill can start immediately
+                    task.model_exec_lock.unlock();
+                }
 
                 {
                     std::lock_guard<std::mutex> lock_guard(m_lock);
@@ -1533,23 +1576,52 @@ private:
                 const auto &input     = *task.input;
                 const auto &tokenizer = *context.m_tokenizer_ptr;
 
-                if (input.m_generation_route_enabled) {
-                    if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
-                        POWERSERVE_LOG_WARN(
-                            "orchestrator decode backend route fallback to cpu, request_id={}, target={}",
-                            input.request_id,
-                            input.m_generation_decode_backend_target
-                        );
-                        (void)set_generation_backend_route(context, "cpu");
+                if (task.private_ggml_kv != nullptr) {
+                    // Phase 2 path: use private GGML KV for true PD overlap
+                    context.m_model_ptr->kv_cache = task.private_ggml_kv->kv_cache.get();
+                    context.m_model_ptr->ggml_kv_override = task.private_ggml_kv.get();
+
+                    struct GgmlKvOverrideGuard {
+                        powerserve::Model *model;
+                        ~GgmlKvOverrideGuard() {
+                            if (model != nullptr) {
+                                model->ggml_kv_override = nullptr;
+                            }
+                        }
+                    } override_guard{context.m_model_ptr.get()};
+                    (void)override_guard;
+                } else {
+                    // Phase 1 path: simple prompt tasks (e.g. query expansion)
+                    // keep the model lock across prefill+decode, use shared KV
+                    if (input.m_generation_route_enabled) {
+                        if (!set_generation_backend_route(context, input.m_generation_decode_backend_target)) {
+                            POWERSERVE_LOG_WARN(
+                                "orchestrator decode backend route fallback to cpu, request_id={}, target={}",
+                                input.request_id,
+                                input.m_generation_decode_backend_target
+                            );
+                            (void)set_generation_backend_route(context, "cpu");
+                        }
                     }
                 }
 
                 POWERSERVE_LOG_INFO("pd orchestrator: decode request {} start", input.request_id);
-                ModelOutput output = m_decode_executor.run_decode(
-                    input,
-                    tokenizer,
-                    task.prefill_result.value()
-                );
+                ModelOutput output;
+                if (task.decode_task.max_decode_steps > 0) {
+                    output = m_decode_executor.run_decode_steps(
+                        input,
+                        tokenizer,
+                        task.prefill_result.value(),
+                        task.decode_task.max_decode_steps,
+                        true
+                    );
+                } else {
+                    output = m_decode_executor.run_decode(
+                        input,
+                        tokenizer,
+                        task.prefill_result.value()
+                    );
+                }
                 task.result_promise.set_value(std::move(output));
             } catch (...) {
                 task.result_promise.set_exception(std::current_exception());

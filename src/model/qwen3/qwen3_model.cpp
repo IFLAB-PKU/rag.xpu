@@ -195,9 +195,13 @@ auto Qwen3Model::forward(
 #endif
     {
         POWERSERVE_ASSERT(!lazy_load, "Qwen3 CPU decode requires full GGUF weights (lazy_load=false)");
-        m_platform->ggml_backends[m_config->model_id]->reset_kv_batch_size(batch_size);
+        powerserve::ggml::GGMLKV *active_ggml_kv = m_platform->ggml_backends[m_config->model_id]->m_kv.get();
+        if (ggml_kv_override != nullptr) {
+            active_ggml_kv = static_cast<powerserve::ggml::GGMLKV *>(ggml_kv_override);
+        }
+        active_ggml_kv->reset_batch_size(batch_size);
         for (size_t L = 0; L < llm_config.n_layers; L++) {
-            auto [k_cache, v_cache] = m_platform->ggml_backends[m_config->model_id]->m_kv->get_cache(L);
+            auto [k_cache, v_cache] = active_ggml_kv->get_cache(L);
             /* lsh 修改起始 */
             bool is_need_bias = false;
             /* lsh 修改结束 */
@@ -224,7 +228,11 @@ auto Qwen3Model::forward(
     } else
 #endif
     {
-        m_platform->ggml_backends[m_config->model_id]->m_kv->advance(batch_size);
+        powerserve::ggml::GGMLKV *active_ggml_kv = m_platform->ggml_backends[m_config->model_id]->m_kv.get();
+        if (ggml_kv_override != nullptr) {
+            active_ggml_kv = static_cast<powerserve::ggml::GGMLKV *>(ggml_kv_override);
+        }
+        active_ggml_kv->advance(batch_size);
     }
 
     if (!lm_head) {
