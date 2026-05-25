@@ -8,6 +8,7 @@ if (POWERSERVE_WITH_OPENCL)
     if (OpenCL_FOUND)
         add_executable(layer_diff_test "layer_diff_test.cpp")
         add_executable(logits_cmp "logits_cmp.cpp")
+        add_executable(opencl_bandwidth_test "opencl_bandwidth_test.cpp")
 
         target_link_libraries(layer_diff_test PRIVATE
             powerserve
@@ -15,6 +16,11 @@ if (POWERSERVE_WITH_OPENCL)
         )
 
         target_link_libraries(logits_cmp PRIVATE
+            powerserve
+            OpenCL::OpenCL
+        )
+
+        target_link_libraries(opencl_bandwidth_test PRIVATE
             powerserve
             OpenCL::OpenCL
         )
@@ -30,12 +36,20 @@ if (POWERSERVE_WITH_OPENCL)
                 -Wextra
                 -Wno-unused-parameter
             )
+            target_compile_options(opencl_bandwidth_test PRIVATE
+                -Wall
+                -Wextra
+                -Wno-unused-parameter
+            )
         endif()
 
         target_include_directories(layer_diff_test PRIVATE
             ${CMAKE_SOURCE_DIR}
         )
         target_include_directories(logits_cmp PRIVATE
+            ${CMAKE_SOURCE_DIR}
+        )
+        target_include_directories(opencl_bandwidth_test PRIVATE
             ${CMAKE_SOURCE_DIR}
         )
 
@@ -51,6 +65,13 @@ if (POWERSERVE_WITH_OPENCL)
             DEPENDS logits_cmp
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
             COMMENT "Running logits compare tests..."
+        )
+
+        add_custom_target(run_opencl_bandwidth_test
+            COMMAND ${CMAKE_COMMAND} -E env POWERSERVE_USE_OPENCL=1 $<TARGET_FILE:opencl_bandwidth_test>
+            DEPENDS opencl_bandwidth_test
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            COMMENT "Running OpenCL bandwidth test..."
         )
     endif()
 endif()
