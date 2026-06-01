@@ -94,6 +94,9 @@ def compile_binary():
     subprocess.run(["git", "submodule", "update", "--init", "--recursive"], check=True)
     print("\033[36mDownloading submodules\033[0m \033[32m[OK]\033[0m")
 
+    models_dir = os.environ.get("POWERSERVE_DOCKER_MODELS_DIR", "/home/frp/models")
+    os.makedirs(models_dir, exist_ok=True)
+
     docker_command = [
         "sudo",
         "docker",
@@ -104,9 +107,11 @@ def compile_binary():
         "--name",
         "powerserve_container",
         "-v",
-        f"{os.getcwd()}:/code",
+        f"{os.getcwd()}:/workspace",
+        "-v",
+        f"{models_dir}:/models",
         "-w",
-        "/code",
+        "/workspace",
         "-e",
         f'https_proxy={os.environ.get("https_proxy", "")}',
         "-e",

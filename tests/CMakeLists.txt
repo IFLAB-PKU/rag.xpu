@@ -5,6 +5,7 @@ endif()
 
 if (POWERSERVE_WITH_OPENCL)
     find_package(OpenCL REQUIRED)
+    find_package(Threads REQUIRED)
     if (OpenCL_FOUND)
         add_executable(layer_diff_test "layer_diff_test.cpp")
         add_executable(logits_cmp "logits_cmp.cpp")
@@ -23,6 +24,7 @@ if (POWERSERVE_WITH_OPENCL)
         target_link_libraries(opencl_bandwidth_test PRIVATE
             powerserve
             OpenCL::OpenCL
+            Threads::Threads
         )
 
         if (NOT MSVC)
