@@ -6,7 +6,7 @@ DEVICE_PROFILE_RAW=""
 if [[ "$#" -gt 0 ]]; then
     DEVICE_PROFILE_RAW="${!#}"
 fi
-DEVICE_PROFILE="8gen5"
+DEVICE_PROFILE="8gen4"
 if [[ "$#" -gt 0 && ( "$DEVICE_PROFILE_RAW" == "8gen4" || "$DEVICE_PROFILE_RAW" == "8gen5" ) ]]; then
     DEVICE_PROFILE="$DEVICE_PROFILE_RAW"
     if [[ "$#" -eq 1 ]]; then
