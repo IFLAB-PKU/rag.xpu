@@ -16,6 +16,11 @@ std::optional<KvCacheRecord> KvCacheManager::get(size_t request_id) const {
     return iter->second;
 }
 
+bool KvCacheManager::bridge_to_cpu(size_t request_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return records_.find(request_id) != records_.end();
+}
+
 void KvCacheManager::release(size_t request_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     records_.erase(request_id);

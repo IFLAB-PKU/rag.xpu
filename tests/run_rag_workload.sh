@@ -35,8 +35,8 @@ esac
 #   ./tests/run_rag_workload.sh <workload> [profile] [enable_pd_orchestrator] [8gen4|8gen5]
 #
 # Examples:
-#   ./tests/run_rag_workload.sh 4K npu_cpu 8gen5 8gen5 false 8gen5
-#   ./tests/run_rag_workload.sh 8K pure_cpu_sequential 8gen4 8gen4 false 8gen4
+#   ./tests/run_rag_workload.sh 4K npu_cpu 8gen5 8gen5 8gen5 false 8gen5
+#   ./tests/run_rag_workload.sh 8K pure_cpu_sequential 8gen4 8gen4 8gen4 false 8gen4
 #   ./tests/run_rag_workload.sh 6K npu_cpu true 8gen5
 
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -21,6 +21,7 @@ class KvCacheManager {
 public:
     void put(const KvCacheRecord &record);
     std::optional<KvCacheRecord> get(size_t request_id) const;
+    bool bridge_to_cpu(size_t request_id) const;
     void release(size_t request_id);
     bool empty() const;
 

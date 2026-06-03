@@ -1349,6 +1349,21 @@ inline GenerationDecodeCandidate blocking_inference_segmented_prefill_decode_tas
             if (!cache_record.has_value()) {
                 throw std::runtime_error("scheduler2 missing kv cache record for decode");
             }
+            if (cache_record->producer_backend == "npu" &&
+                decode_route.backend == BackendKind::CPU) {
+                const bool bridged = server_context.kv_cache_manager->bridge_to_cpu(input.request_id);
+                if (bridged) {
+                    POWERSERVE_LOG_INFO(
+                        "scheduler2 kv bridge hook: request_id={}, prefill_backend=npu, decode_backend=cpu",
+                        input.request_id
+                    );
+                } else {
+                    POWERSERVE_LOG_WARN(
+                        "scheduler2 kv bridge hook failed: request_id={}",
+                        input.request_id
+                    );
+                }
+            }
 
             try {
                 const auto &tokenizer = *context.m_tokenizer_ptr;

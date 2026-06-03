@@ -50,7 +50,6 @@ struct RagRequest {
     std::string generation_prefill_backend = "auto";
     std::string generation_decode_backend = "auto";
     float temperature = 0.2F;
-    bool enable_pd_orchestrator = false;
 };
 
 struct RagStageMetrics {
@@ -794,40 +793,21 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
     bool segmented_prefill_used = false;
     try {
-        if (request.enable_pd_orchestrator) {
-            static PDOrchestrator pd_orchestrator;
-            for (const auto &task : generation_tasks) {
-                const std::string task_prompt = task.input_segments.empty()
-                    ? build_generation_prompt(request.query, selected_context)
-                    : task.input_segments.front();
+        for (const auto &task : generation_tasks) {
+            const std::string task_prompt = task.input_segments.empty()
+                ? build_generation_prompt(request.query, selected_context)
+                : task.input_segments.front();
 
-                ModelInput generation_input = make_generation_input(request, task_prompt);
-                apply_generation_route_to_input(generation_input, generation_route_plan);
-                const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
-                GenerationDecodeCandidate candidate = pd_orchestrator.run_segmented_task(
-                    generation_context,
-                    generation_input,
-                    task
-                );
-                generation_candidates.push_back(std::move(candidate));
-            }
-        } else {
-            for (const auto &task : generation_tasks) {
-                const std::string task_prompt = task.input_segments.empty()
-                    ? build_generation_prompt(request.query, selected_context)
-                    : task.input_segments.front();
-
-                ModelInput generation_input = make_generation_input(request, task_prompt);
-                apply_generation_route_to_input(generation_input, generation_route_plan);
-                const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
-                GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_decode_task(
-                    server_context,
-                    generation_context,
-                    generation_input,
-                    task
-                );
-                generation_candidates.push_back(std::move(candidate));
-            }
+            ModelInput generation_input = make_generation_input(request, task_prompt);
+            apply_generation_route_to_input(generation_input, generation_route_plan);
+            const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
+            GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_decode_task(
+                server_context,
+                generation_context,
+                generation_input,
+                task
+            );
+            generation_candidates.push_back(std::move(candidate));
         }
 
         const GenerationMergeResult merge_result = merge_generation_candidates_v1(generation_candidates);
