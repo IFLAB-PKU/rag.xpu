@@ -1,7 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERIAL="3B15940035V00000"
+DEVICE_PROFILE_RAW=""
+if [[ "$#" -gt 0 ]]; then
+    DEVICE_PROFILE_RAW="${!#}"
+fi
+DEVICE_PROFILE="8gen5"
+if [[ "$#" -gt 0 && ( "$DEVICE_PROFILE_RAW" == "8gen4" || "$DEVICE_PROFILE_RAW" == "8gen5" ) ]]; then
+    DEVICE_PROFILE="$DEVICE_PROFILE_RAW"
+    if [[ "$#" -eq 1 ]]; then
+        set --
+    else
+        set -- "${@:1:$(($# - 1))}"
+    fi
+fi
+
+case "$DEVICE_PROFILE" in
+  8gen4)
+    SERIAL="3B15940035V00000"
+    ;;
+  8gen5)
+    SERIAL="3B15CR0014H00000"
+    ;;
+  *)
+    echo "unknown device flag: $DEVICE_PROFILE" >&2
+    echo "try: 8gen4 | 8gen5" >&2
+    exit 2
+    ;;
+esac
+
+
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_DOC="$LOCAL_DIR/rag_long_doc.txt"
 LOCAL_PAYLOAD="$LOCAL_DIR/rag_payload_once.json"
@@ -34,7 +62,7 @@ case "$PROFILE" in
   -h|--help|help)
     cat <<'EOF'
 Usage:
-  ./tests/run_rag_once.sh [profile] [enable_pd_orchestrator]
+  ./tests/run_rag_once.sh [profile] [enable_pd_orchestrator] [8gen4|8gen5]
 
 Profiles:
   pure_cpu_sequential  prefill=cpu, decode=cpu, mode=sequential
@@ -46,9 +74,9 @@ Enable PD Orchestrator (optional, default false):
   false  use SequentialSegmentPrefillQueueDemo (default)
 
 Examples:
-  ./tests/run_rag_once.sh pure_cpu_sequential
-  ./tests/run_rag_once.sh npu_cpu true
-  ./tests/run_rag_once.sh npu_cpu false
+  ./tests/run_rag_once.sh pure_cpu_sequential 8gen5
+  ./tests/run_rag_once.sh npu_cpu 8gen5 true 8gen5
+  ./tests/run_rag_once.sh npu_cpu 8gen5 false 8gen4
 EOF
     exit 0
     ;;
@@ -88,7 +116,7 @@ echo "[2/4] push long doc to phone"
 adb -s "$SERIAL" push "$LOCAL_DOC" "$PHONE_DOC" >/dev/null
 
 echo "[3/4] build one-shot payload"
-echo "profile=$PROFILE mode=$MODE prefill=$GEN_PREFILL_BACKEND decode=$GEN_DECODE_BACKEND pd_orchestrator=$PD_ORCHESTRATOR"
+echo "profile=$PROFILE mode=$MODE prefill=$GEN_PREFILL_BACKEND decode=$GEN_DECODE_BACKEND pd_orchestrator=$PD_ORCHESTRATOR device=$DEVICE_PROFILE serial=$SERIAL"
 LOCAL_DOC_FOR_PY="$LOCAL_DOC" \
 LOCAL_PAYLOAD_FOR_PY="$LOCAL_PAYLOAD" \
 RAG_MODE="$MODE" \
@@ -120,8 +148,8 @@ payload = {
     'enable_pd_orchestrator': rag_pd_orchestrator,
     'top_k': 20,
     'top_n': 5,
-    'generation_decode_steps': 192,
-    'max_tokens': 192,
+    'generation_decode_steps': 64,
+    'max_tokens': 64,
     'temperature': 0.1,
 }
 Path(local_payload).write_text(
@@ -142,6 +170,8 @@ echo
 echo "done"
 echo "phone doc path: $PHONE_DOC"
 echo "local payload:  $LOCAL_PAYLOAD"
+echo "device flag: $DEVICE_PROFILE"
+echo "serial: $SERIAL"
 echo "pd_orchestrator: $PD_ORCHESTRATOR"
 
 # How to run

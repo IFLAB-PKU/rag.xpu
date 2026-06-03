@@ -69,7 +69,6 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
 inline nlohmann::json dump_rag_response(const RagResponse &response) {
     const nlohmann::json stage_timeline = nlohmann::json::array({
         nlohmann::json{{"stage", "indexing"}, {"ms", response.metrics.indexing_ms}},
-        nlohmann::json{{"stage", "doc_embedding"}, {"ms", response.metrics.doc_embedding_ms}},
         nlohmann::json{{"stage", "query_expand"}, {"ms", response.metrics.query_expand_ms}},
         nlohmann::json{{"stage", "query_embedding"}, {"ms", response.metrics.query_embedding_ms}},
         nlohmann::json{{"stage", "searching"}, {"ms", response.metrics.searching_ms}},
@@ -115,7 +114,6 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
         {"stage_metrics_ms",
          {{"indexing", response.metrics.indexing_ms},
           {"query_expand", response.metrics.query_expand_ms},
-                    {"doc_embedding", response.metrics.doc_embedding_ms},
                     {"query_embedding", response.metrics.query_embedding_ms},
           {"embedding", response.metrics.embedding_ms},
           {"searching", response.metrics.searching_ms},

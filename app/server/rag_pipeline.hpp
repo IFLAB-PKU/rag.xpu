@@ -56,7 +56,6 @@ struct RagRequest {
 struct RagStageMetrics {
     size_t indexing_ms = 0;
     size_t query_expand_ms = 0;
-    size_t doc_embedding_ms = 0;
     size_t query_embedding_ms = 0;
     size_t embedding_ms = 0;
     size_t searching_ms = 0;
@@ -623,6 +622,21 @@ inline std::string maybe_expand_rag_query(
     return candidate.empty() ? request.query : candidate;
 }
 
+inline void log_rag_stage_metrics(const RagResponse &response) {
+    POWERSERVE_LOG_INFO(
+        "rag stage metrics (mode={}): indexing(split+doc_embedding)={}ms, query_expand={}ms, query_embedding={}ms, embedding={}ms, searching={}ms, reranking={}ms, generation={}ms, total={}ms",
+        response.mode_used,
+        response.metrics.indexing_ms,
+        response.metrics.query_expand_ms,
+        response.metrics.query_embedding_ms,
+        response.metrics.embedding_ms,
+        response.metrics.searching_ms,
+        response.metrics.reranking_ms,
+        response.metrics.generation_ms,
+        response.metrics.total_ms
+    );
+}
+
 inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRequest &request) {
     using namespace powerserve;
 
@@ -648,16 +662,16 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
 
     Timer total_timer;
 
-    // 1) Indexing
+    // 1) Indexing (doc split + doc embedding)
     Timer stage_timer;
     const std::vector<std::string> chunks = rag_split_document(request.doc);
-    response.metrics.indexing_ms = stage_timer.elapsed_time_ms();
+    const size_t split_ms = stage_timer.elapsed_time_ms();
     if (chunks.empty()) {
         throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
     }
 
-    // 2) Document embedding
     stage_timer = Timer{};
+    size_t doc_embedding_ms = 0;
     std::vector<std::vector<float>> doc_embeddings;
     std::vector<size_t> doc_embedding_source_indices;
     doc_embeddings.reserve(chunks.size());
@@ -671,13 +685,14 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         doc_embeddings.push_back(doc_embedding_out.m_embedding);
         doc_embedding_source_indices.push_back(chunk_idx);
     }
-    response.metrics.doc_embedding_ms = stage_timer.elapsed_time_ms();
-    response.metrics.embedding_ms = response.metrics.doc_embedding_ms;
+    doc_embedding_ms = stage_timer.elapsed_time_ms();
+    response.metrics.indexing_ms = split_ms + doc_embedding_ms;
+    response.metrics.embedding_ms = doc_embedding_ms;
     if (doc_embeddings.empty()) {
         throw std::runtime_error("all document embeddings are empty");
     }
 
-    // 3) Query expansion (optional)
+    // 2) Query expansion (optional)
     const std::string expanded_query = maybe_expand_rag_query(
         server_context,
         request,
@@ -700,7 +715,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         response.sub_queries.empty() ? std::vector<std::string>{expanded_query} : response.sub_queries;
     response.query_used = request.query;
 
-    // 4) Query embeddings (all sub-queries first)
+    // 3) Query embeddings (all sub-queries first)
     stage_timer = Timer{};
     std::vector<std::vector<float>> query_embeddings;
     query_embeddings.reserve(retrieval_queries.size());
@@ -717,7 +732,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     response.metrics.query_embedding_ms = stage_timer.elapsed_time_ms();
     response.metrics.embedding_ms += response.metrics.query_embedding_ms;
 
-    // 5) Searching (all sub-queries, then merge/dedup)
+    // 4) Searching (all sub-queries, then merge/dedup)
     stage_timer = Timer{};
     std::vector<std::vector<size_t>> per_query_top_indices;
     per_query_top_indices.reserve(query_embeddings.size());
@@ -743,7 +758,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         throw std::runtime_error("retrieval returns empty top_k docs");
     }
 
-    // 6) Reranking
+    // 5) Reranking
     stage_timer = Timer{};
     const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
 
@@ -765,7 +780,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     }
     response.metrics.reranking_ms = stage_timer.elapsed_time_ms();
 
-    // 7) Generation
+    // 6) Generation
     stage_timer = Timer{};
     const std::vector<GenerationDecodeTask> generation_tasks = build_generation_decode_tasks(
         request.query,
@@ -886,6 +901,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     response.metrics.generation_ms = stage_timer.elapsed_time_ms();
 
     response.metrics.total_ms = total_timer.elapsed_time_ms();
+    log_rag_stage_metrics(response);
     return response;
 }
 
@@ -933,7 +949,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
         Timer stage_timer;
         out.chunks = rag_split_document(request.doc);
-        out.indexing_ms = stage_timer.elapsed_time_ms();
+        const size_t split_ms = stage_timer.elapsed_time_ms();
         if (out.chunks.empty()) {
             throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
         }
@@ -951,6 +967,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
             out.doc_embedding_source_indices.push_back(chunk_idx);
         }
         out.doc_embedding_ms = stage_timer.elapsed_time_ms();
+        out.indexing_ms = split_ms + out.doc_embedding_ms;
 
         if (out.doc_embeddings.empty()) {
             throw std::runtime_error("all document embeddings are empty");
@@ -1003,9 +1020,8 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     }
 
     response.metrics.indexing_ms = doc_branch.indexing_ms;
-    response.metrics.doc_embedding_ms = doc_branch.doc_embedding_ms;
     response.metrics.query_expand_ms = query_branch.query_expand_ms;
-    response.metrics.embedding_ms = response.metrics.doc_embedding_ms + response.metrics.query_embedding_ms;
+    response.metrics.embedding_ms = doc_branch.doc_embedding_ms + response.metrics.query_embedding_ms;
 
     // Searching
     stage_timer = Timer{};
@@ -1158,5 +1174,6 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     response.metrics.generation_ms = stage_timer.elapsed_time_ms();
 
     response.metrics.total_ms = total_timer.elapsed_time_ms();
+    log_rag_stage_metrics(response);
     return response;
 }

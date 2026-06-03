@@ -1,0 +1,17 @@
+{
+  "4K": {
+    "payload_file": "tests/rag_payload_once.json",
+    "doc_file": "tests/workloads/doc_4K.txt",
+    "description": "Lightweight retrieval: short document, single fact lookup"
+  },
+  "6K": {
+    "payload_file": "tests/rag_payload_once.json",
+    "doc_file": "tests/workloads/doc_6K.txt",
+    "description": "Moderate retrieval: requires comparing two distinct passages"
+  },
+  "8K": {
+    "payload_file": "tests/rag_payload_once.json",
+    "doc_file": "tests/workloads/doc_8K.txt",
+    "description": "Heavy retrieval: must locate specific info among stellar evolution and galaxy structure content"
+  }
+}

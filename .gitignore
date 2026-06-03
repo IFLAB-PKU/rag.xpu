@@ -30,3 +30,4 @@ tests/pd-bench-*.csv
 tests/server-metrics*.md
 tests/server-overlap.log
 tests/results/
+tests/rag_payload_*.json
