@@ -3,28 +3,26 @@ set -euo pipefail
 
 # Benchmark all workloads (4K/6K/8K) with a given profile.
 # Usage:
-#   ./tests/run_rag_benchmark.sh [profile] [enable_pd_orchestrator]
+#   ./tests/run_rag_benchmark.sh [profile]
 #
 # Examples:
-#   ./tests/run_rag_benchmark.sh npu_cpu false
-#   ./tests/run_rag_benchmark.sh pure_cpu_sequential false
-#   ./tests/run_rag_benchmark.sh npu_cpu true
+#   ./tests/run_rag_benchmark.sh npu_cpu
+#   ./tests/run_rag_benchmark.sh pure_cpu_sequential
+#   ./tests/run_rag_benchmark.sh pure_npu_sequential
 
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILE="${1:-npu_cpu}"
-PD_ORCHESTRATOR="${2:-false}"
 
 WORKLOADS=("4K" "6K" "8K")
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULT_DIR="$LOCAL_DIR/results"
-RESULT_FILE="$RESULT_DIR/benchmark_${PROFILE}_${PD_ORCHESTRATOR}_${TIMESTAMP}.json"
+RESULT_FILE="$RESULT_DIR/benchmark_${PROFILE}_${TIMESTAMP}.json"
 
 mkdir -p "$RESULT_DIR"
 
 echo "========================================"
 echo "RAG Workload Benchmark"
 echo "profile: $PROFILE"
-echo "pd_orchestrator: $PD_ORCHESTRATOR"
 echo "timestamp: $TIMESTAMP"
 echo "========================================"
 
@@ -37,7 +35,7 @@ for workload in "${WORKLOADS[@]}"; do
     echo ">>> Running workload: $workload"
 
     # Run the workload and capture raw JSON response
-    response=$("$LOCAL_DIR/run_rag_workload.sh" "$workload" "$PROFILE" "$PD_ORCHESTRATOR")
+    response=$("$LOCAL_DIR/run_rag_workload.sh" "$workload" "$PROFILE")
 
     # Extract stage metrics using python
     metrics=$(python3 -c "
@@ -66,7 +64,6 @@ out = {
     'generation_decode_backend_target': data.get('debug', {}).get('generation_decode_backend_target', ''),
     'generation_segmented_prefill_used': data.get('debug', {}).get('generation_segmented_prefill_used', False),
     'indexing_ms': metrics.get('indexing', 0),
-    'doc_embedding_ms': metrics.get('doc_embedding', 0),
     'query_embedding_ms': metrics.get('query_embedding', 0),
     'embedding_ms': metrics.get('embedding', 0),
     'query_expand_ms': metrics.get('query_expand', 0),
@@ -104,8 +101,10 @@ python3 -c "
 import json
 with open('$RESULT_FILE') as f:
     data = json.load(f)
-print(f'{'Workload':<8} {'Mode':<18} {'Total(ms)':<12} {'Indexing':<10} {'DocEmb':<10} {'QueryEmb':<10} {'Search':<10} {'Rerank':<10} {'Gen':<10}')
+print('{:<8} {:<18} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}'.format(
+    'Workload', 'Mode', 'Total(ms)', 'Indexing', 'Embedding', 'QueryEmb', 'Search', 'Rerank', 'Gen'
+))
 print('-' * 100)
 for row in data:
-    print(f\"{row['workload']:<8} {row['mode_used']:<18} {row['total_ms']:<12.1f} {row['indexing_ms']:<10.1f} {row['doc_embedding_ms']:<10.1f} {row['query_embedding_ms']:<10.1f} {row['searching_ms']:<10.1f} {row['reranking_ms']:<10.1f} {row['generation_ms']:<10.1f}\")
+    print(f\"{row['workload']:<8} {row['mode_used']:<18} {row['total_ms']:<12.1f} {row['indexing_ms']:<10.1f} {row['embedding_ms']:<10.1f} {row['query_embedding_ms']:<10.1f} {row['searching_ms']:<10.1f} {row['reranking_ms']:<10.1f} {row['generation_ms']:<10.1f}\")
 "
