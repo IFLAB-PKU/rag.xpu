@@ -74,9 +74,9 @@ Enable PD Orchestrator (optional, default false):
   false  use SequentialSegmentPrefillQueueDemo (default)
 
 Examples:
-  ./tests/run_rag_once.sh pure_cpu_sequential 8gen5
-  ./tests/run_rag_once.sh npu_cpu 8gen5 true 8gen5
-  ./tests/run_rag_once.sh npu_cpu 8gen5 false 8gen4
+  ./tests/run_rag_once.sh pure_cpu_sequential 8gen5 8gen5
+  ./tests/run_rag_once.sh npu_cpu 8gen5 8gen5 true 8gen5
+  ./tests/run_rag_once.sh npu_cpu 8gen5 8gen5 false 8gen4
 EOF
     exit 0
     ;;

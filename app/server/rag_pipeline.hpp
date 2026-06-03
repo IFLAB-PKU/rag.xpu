@@ -821,6 +821,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
                 apply_generation_route_to_input(generation_input, generation_route_plan);
                 const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
                 GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_decode_task(
+                    server_context,
                     generation_context,
                     generation_input,
                     task
@@ -1094,6 +1095,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
             apply_generation_route_to_input(generation_input, generation_route_plan);
             const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
             GenerationDecodeCandidate candidate = blocking_inference_segmented_prefill_decode_task(
+                server_context,
                 generation_context,
                 generation_input,
                 task
