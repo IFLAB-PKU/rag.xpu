@@ -924,135 +924,210 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     response.generation_route_note = generation_route_plan.route_note;
 
     Timer total_timer;
+    POWERSERVE_ASSERT(server_context.scheduler2 != nullptr);
 
-    auto doc_branch_future = std::async(std::launch::async, [&server_context, &request]() -> DocBranchOutput {
-        DocBranchOutput out;
+    DocBranchOutput doc_branch;
+    QueryBranchOutput query_branch;
+    {
+        std::vector<powerserve::Scheduler2DagNode> dag_nodes;
+        dag_nodes.reserve(2);
+        dag_nodes.push_back({
+            .node_id = 1,
+            .type = powerserve::Scheduler2TaskType::UNKNOWN,
+            .request_id = next_rag_request_id(),
+            .backend = powerserve::BackendKind::CPU,
+            .dependencies = {},
+            .fn = [&]() {
+                DocBranchOutput out;
 
-        Timer stage_timer;
-        out.chunks = rag_split_document(request.doc);
-        const size_t split_ms = stage_timer.elapsed_time_ms();
-        if (out.chunks.empty()) {
-            throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
-        }
+                Timer stage_timer;
+                out.chunks = rag_split_document(request.doc);
+                const size_t split_ms = stage_timer.elapsed_time_ms();
+                if (out.chunks.empty()) {
+                    throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
+                }
 
-        stage_timer = Timer{};
-        out.doc_embeddings.reserve(out.chunks.size());
-        out.doc_embedding_source_indices.reserve(out.chunks.size());
-        for (size_t chunk_idx = 0; chunk_idx < out.chunks.size(); ++chunk_idx) {
-            const auto &chunk = out.chunks[chunk_idx];
-            const ModelOutput doc_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, chunk));
-            if (doc_embedding_out.m_embedding.empty()) {
-                continue;
-            }
-            out.doc_embeddings.push_back(doc_embedding_out.m_embedding);
-            out.doc_embedding_source_indices.push_back(chunk_idx);
-        }
-        out.doc_embedding_ms = stage_timer.elapsed_time_ms();
-        out.indexing_ms = split_ms + out.doc_embedding_ms;
+                stage_timer = Timer{};
+                out.doc_embeddings.reserve(out.chunks.size());
+                out.doc_embedding_source_indices.reserve(out.chunks.size());
+                for (size_t chunk_idx = 0; chunk_idx < out.chunks.size(); ++chunk_idx) {
+                    const auto &chunk = out.chunks[chunk_idx];
+                    const ModelOutput doc_embedding_out =
+                        embedding(server_context, make_embedding_input(request.embedding_model, chunk));
+                    if (doc_embedding_out.m_embedding.empty()) {
+                        continue;
+                    }
+                    out.doc_embeddings.push_back(doc_embedding_out.m_embedding);
+                    out.doc_embedding_source_indices.push_back(chunk_idx);
+                }
+                out.doc_embedding_ms = stage_timer.elapsed_time_ms();
+                out.indexing_ms = split_ms + out.doc_embedding_ms;
 
-        if (out.doc_embeddings.empty()) {
-            throw std::runtime_error("all document embeddings are empty");
-        }
-        return out;
-    });
+                if (out.doc_embeddings.empty()) {
+                    throw std::runtime_error("all document embeddings are empty");
+                }
+                doc_branch = std::move(out);
+            },
+            .debug_name = "indexing",
+        });
+        dag_nodes.push_back({
+            .node_id = 2,
+            .type = powerserve::Scheduler2TaskType::UNKNOWN,
+            .request_id = next_rag_request_id(),
+            .backend = powerserve::BackendKind::CPU,
+            .dependencies = {},
+            .fn = [&]() {
+                QueryBranchOutput out;
+                const GenerationRoutePlan route_plan = plan_generation_route(request);
+                out.expanded_query = maybe_expand_rag_query(server_context, request, route_plan, out.query_expand_ms);
+                if (request.enable_query_expansion) {
+                    // Keep Step1-compatible sub-query behavior in parallel mode.
+                    const auto parsed_sub_queries = rag_split_sub_queries(out.expanded_query);
+                    (void)parsed_sub_queries;
+                    out.sub_queries = {
+                        "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
+                        "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
+                        "OpenAI 在安全方面的发展中体现了哪些权衡取舍?"
+                    };
+                }
+                query_branch = std::move(out);
+            },
+            .debug_name = "query_expand",
+        });
+        server_context.scheduler2->submit_dag(std::move(dag_nodes)).get();
+    }
 
-    auto query_branch_future = std::async(std::launch::async, [&server_context, &request]() -> QueryBranchOutput {
-        QueryBranchOutput out;
-        const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
-        out.expanded_query = maybe_expand_rag_query(server_context, request, generation_route_plan, out.query_expand_ms);
-        if (request.enable_query_expansion) {
-            // Keep Step1-compatible sub-query behavior in parallel mode.
-            const auto parsed_sub_queries = rag_split_sub_queries(out.expanded_query);
-            (void)parsed_sub_queries;
-            out.sub_queries = {
-                "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
-                "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
-                "OpenAI 在安全方面的发展中体现了哪些权衡取舍?"
-            };
-        }
-        return out;
-    });
-
-    const QueryBranchOutput query_branch = query_branch_future.get();
     response.sub_queries = query_branch.sub_queries;
     response.query_used = request.query;
 
     const std::vector<std::string> retrieval_queries =
         response.sub_queries.empty() ? std::vector<std::string>{query_branch.expanded_query} : response.sub_queries;
+    std::vector<std::vector<float>> query_embeddings(retrieval_queries.size());
+    std::vector<std::vector<size_t>> per_query_top_indices(retrieval_queries.size());
+    std::vector<size_t> merged_top_indices;
+    std::vector<std::string> top_k_docs;
+    std::vector<size_t> top_k_indices_collected;
+    std::vector<size_t> top_n_indices_collected;
+    std::vector<std::string> selected_context;
 
-    Timer query_embedding_timer;
-    query_embedding_timer = Timer{};
-    std::vector<std::vector<float>> query_embeddings;
-    query_embeddings.reserve(retrieval_queries.size());
-    for (const auto &sub_query : retrieval_queries) {
-        const ModelOutput query_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, sub_query));
-        if (query_embedding_out.m_embedding.empty()) {
-            continue;
+    std::atomic_size_t query_embedding_ms_acc{0};
+    std::atomic_size_t searching_ms_acc{0};
+    std::atomic_size_t reranking_ms_acc{0};
+
+    {
+        std::vector<powerserve::Scheduler2DagNode> dag_nodes;
+        dag_nodes.reserve(retrieval_queries.size() * 2 + 1);
+        std::vector<size_t> search_node_ids;
+        search_node_ids.reserve(retrieval_queries.size());
+
+        for (size_t i = 0; i < retrieval_queries.size(); ++i) {
+            const size_t embedding_node_id = 1000 + i * 2;
+            const size_t searching_node_id = embedding_node_id + 1;
+            search_node_ids.push_back(searching_node_id);
+
+            dag_nodes.push_back({
+                .node_id = embedding_node_id,
+                .type = powerserve::Scheduler2TaskType::UNKNOWN,
+                .request_id = next_rag_request_id(),
+                .backend = powerserve::BackendKind::CPU,
+                .dependencies = {},
+                .fn = [&, i]() {
+                    Timer timer;
+                    const ModelOutput query_embedding_out =
+                        embedding(server_context, make_embedding_input(request.embedding_model, retrieval_queries[i]));
+                    if (query_embedding_out.m_embedding.empty()) {
+                        throw std::runtime_error("query embedding is empty");
+                    }
+                    query_embeddings[i] = query_embedding_out.m_embedding;
+                    query_embedding_ms_acc.fetch_add(timer.elapsed_time_ms(), std::memory_order_relaxed);
+                },
+                .debug_name = "query_embedding_" + std::to_string(i + 1),
+            });
+
+            dag_nodes.push_back({
+                .node_id = searching_node_id,
+                .type = powerserve::Scheduler2TaskType::UNKNOWN,
+                .request_id = next_rag_request_id(),
+                .backend = powerserve::BackendKind::CPU,
+                .dependencies = {embedding_node_id},
+                .fn = [&, i]() {
+                    Timer timer;
+                    per_query_top_indices[i] = rag_search_faiss_ip(
+                        doc_branch.doc_embeddings,
+                        doc_branch.doc_embedding_source_indices,
+                        query_embeddings[i],
+                        request.top_k
+                    );
+                    searching_ms_acc.fetch_add(timer.elapsed_time_ms(), std::memory_order_relaxed);
+                },
+                .debug_name = "searching_" + std::to_string(i + 1),
+            });
         }
-        query_embeddings.push_back(query_embedding_out.m_embedding);
-    }
 
-    const DocBranchOutput doc_branch = doc_branch_future.get();
+        dag_nodes.push_back({
+            .node_id = 9000,
+            .type = powerserve::Scheduler2TaskType::UNKNOWN,
+            .request_id = next_rag_request_id(),
+            .backend = powerserve::BackendKind::CPU,
+            .dependencies = search_node_ids,
+            .fn = [&]() {
+                Timer merge_timer;
+                merged_top_indices = rag_merge_subquery_hits(per_query_top_indices, request.top_k);
+                const size_t actual_top_k = merged_top_indices.size();
+                top_k_docs.clear();
+                top_k_indices_collected.clear();
+                top_k_docs.reserve(actual_top_k);
+                top_k_indices_collected.reserve(actual_top_k);
+                for (size_t i = 0; i < actual_top_k; ++i) {
+                    top_k_indices_collected.push_back(merged_top_indices[i]);
+                    top_k_docs.push_back(doc_branch.chunks[merged_top_indices[i]]);
+                }
+                searching_ms_acc.fetch_add(merge_timer.elapsed_time_ms(), std::memory_order_relaxed);
 
-    Timer stage_timer;
-    response.metrics.query_embedding_ms = query_embedding_timer.elapsed_time_ms();
-    if (query_embeddings.empty()) {
-        throw std::runtime_error("all query embeddings are empty");
+                if (top_k_docs.empty()) {
+                    throw std::runtime_error("retrieval returns empty top_k docs");
+                }
+
+                Timer rerank_timer;
+                const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
+
+                selected_context.clear();
+                top_n_indices_collected.clear();
+                selected_context.reserve(rerank_out.m_rerank_results.size());
+                top_n_indices_collected.reserve(rerank_out.m_rerank_results.size());
+                for (const auto &item : rerank_out.m_rerank_results) {
+                    if (item.index >= top_k_docs.size()) {
+                        continue;
+                    }
+                    top_n_indices_collected.push_back(top_k_indices_collected[item.index]);
+                    selected_context.push_back(top_k_docs[item.index]);
+                }
+                if (selected_context.empty()) {
+                    const size_t fallback_n = std::min(request.top_n, top_k_docs.size());
+                    for (size_t i = 0; i < fallback_n; ++i) {
+                        top_n_indices_collected.push_back(top_k_indices_collected[i]);
+                        selected_context.push_back(top_k_docs[i]);
+                    }
+                }
+                reranking_ms_acc.store(rerank_timer.elapsed_time_ms(), std::memory_order_relaxed);
+            },
+            .debug_name = "reranking",
+        });
+
+        server_context.scheduler2->submit_dag(std::move(dag_nodes)).get();
     }
 
     response.metrics.indexing_ms = doc_branch.indexing_ms;
     response.metrics.query_expand_ms = query_branch.query_expand_ms;
+    response.metrics.query_embedding_ms = query_embedding_ms_acc.load(std::memory_order_relaxed);
     response.metrics.embedding_ms = doc_branch.doc_embedding_ms + response.metrics.query_embedding_ms;
-
-    // Searching
-    stage_timer = Timer{};
-    std::vector<std::vector<size_t>> per_query_top_indices;
-    per_query_top_indices.reserve(query_embeddings.size());
-    for (const auto &query_embedding : query_embeddings) {
-        per_query_top_indices.push_back(rag_search_faiss_ip(
-            doc_branch.doc_embeddings,
-            doc_branch.doc_embedding_source_indices,
-            query_embedding,
-            request.top_k
-        ));
-    }
-    const std::vector<size_t> merged_top_indices = rag_merge_subquery_hits(per_query_top_indices, request.top_k);
-
-    const size_t actual_top_k = merged_top_indices.size();
-    std::vector<std::string> top_k_docs;
-    top_k_docs.reserve(actual_top_k);
-    for (size_t i = 0; i < actual_top_k; ++i) {
-        response.top_k_indices.push_back(merged_top_indices[i]);
-        top_k_docs.push_back(doc_branch.chunks[merged_top_indices[i]]);
-    }
-    response.metrics.searching_ms = stage_timer.elapsed_time_ms();
-    if (top_k_docs.empty()) {
-        throw std::runtime_error("retrieval returns empty top_k docs");
-    }
-
-    // Reranking
-    stage_timer = Timer{};
-    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
-
-    std::vector<std::string> selected_context;
-    for (const auto &item : rerank_out.m_rerank_results) {
-        if (item.index >= top_k_docs.size()) {
-            continue;
-        }
-        response.top_n_indices.push_back(response.top_k_indices[item.index]);
-        selected_context.push_back(top_k_docs[item.index]);
-    }
-
-    if (selected_context.empty()) {
-        const size_t fallback_n = std::min(request.top_n, top_k_docs.size());
-        for (size_t i = 0; i < fallback_n; ++i) {
-            response.top_n_indices.push_back(response.top_k_indices[i]);
-            selected_context.push_back(top_k_docs[i]);
-        }
-    }
-    response.metrics.reranking_ms = stage_timer.elapsed_time_ms();
+    response.metrics.searching_ms = searching_ms_acc.load(std::memory_order_relaxed);
+    response.metrics.reranking_ms = reranking_ms_acc.load(std::memory_order_relaxed);
+    response.top_k_indices = std::move(top_k_indices_collected);
+    response.top_n_indices = std::move(top_n_indices_collected);
 
     // Generation
+    Timer stage_timer;
     stage_timer = Timer{};
     const std::vector<GenerationDecodeTask> generation_tasks = build_generation_decode_tasks(
         request.query,

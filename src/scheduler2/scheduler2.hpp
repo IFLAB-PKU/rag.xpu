@@ -10,8 +10,10 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 namespace powerserve {
 
@@ -41,6 +43,16 @@ struct Scheduler2Task {
     std::chrono::steady_clock::time_point enqueued_at = std::chrono::steady_clock::now();
 };
 
+struct Scheduler2DagNode {
+    size_t node_id = 0;
+    Scheduler2TaskType type = Scheduler2TaskType::UNKNOWN;
+    size_t request_id = 0;
+    BackendKind backend = BackendKind::CPU;
+    std::vector<size_t> dependencies;
+    std::function<void()> fn;
+    std::string debug_name;
+};
+
 class Scheduler2 {
 public:
     Scheduler2();
@@ -53,20 +65,17 @@ public:
         auto packaged = std::make_shared<std::packaged_task<ReturnType()>>(std::forward<F>(fn));
         std::future<ReturnType> result = packaged->get_future();
 
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            queue_.push_back(Scheduler2Task{
-                .type = type,
-                .request_id = request_id,
-                .backend = backend,
-                .fn = [packaged]() { (*packaged)(); },
-                .enqueued_at = std::chrono::steady_clock::now(),
-            });
-        }
-        cv_.notify_one();
+        enqueue_task(Scheduler2Task{
+            .type = type,
+            .request_id = request_id,
+            .backend = backend,
+            .fn = [packaged]() { (*packaged)(); },
+            .enqueued_at = std::chrono::steady_clock::now(),
+        });
         return result;
     }
 
+    std::future<void> submit_dag(std::vector<Scheduler2DagNode> nodes);
     void drain();
     size_t pending_count() const;
     size_t active_count() const;
@@ -80,6 +89,7 @@ private:
     bool shutdown_ = false;
     size_t active_count_ = 0;
 
+    void enqueue_task(Scheduler2Task task);
     void worker_loop();
 };
 
