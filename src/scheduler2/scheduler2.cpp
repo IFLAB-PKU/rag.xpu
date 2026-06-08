@@ -8,11 +8,22 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <mutex>
 
 namespace powerserve {
 
-Scheduler2::Scheduler2() : worker_([this]() { worker_loop(); }) {
-    POWERSERVE_LOG_INFO("Scheduler2 started (FIFO, 1 worker)");
+namespace {
+
+bool should_enqueue_cpu(BackendKind backend) {
+    return backend == BackendKind::CPU || backend == BackendKind::AUTO;
+}
+
+} // namespace
+
+Scheduler2::Scheduler2() :
+    worker_cpu_([this]() { worker_loop(BackendKind::CPU); }),
+    worker_npu_([this]() { worker_loop(BackendKind::NPU); }) {
+    POWERSERVE_LOG_INFO("Scheduler2 started (FIFO, 2 workers: cpu+npu)");
 }
 
 Scheduler2::~Scheduler2() {
@@ -21,8 +32,11 @@ Scheduler2::~Scheduler2() {
         shutdown_ = true;
     }
     cv_.notify_all();
-    if (worker_.joinable()) {
-        worker_.join();
+    if (worker_cpu_.joinable()) {
+        worker_cpu_.join();
+    }
+    if (worker_npu_.joinable()) {
+        worker_npu_.join();
     }
     POWERSERVE_LOG_INFO("Scheduler2 stopped");
 }
@@ -30,7 +44,11 @@ Scheduler2::~Scheduler2() {
 void Scheduler2::enqueue_task(Scheduler2Task task) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push_back(std::move(task));
+        if (should_enqueue_cpu(task.backend)) {
+            cpu_queue_.push_back(std::move(task));
+        } else {
+            npu_queue_.push_back(std::move(task));
+        }
     }
     cv_.notify_one();
 }
@@ -64,6 +82,7 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
 
     auto indegree = std::make_shared<std::unordered_map<size_t, size_t>>();
     auto children = std::make_shared<std::unordered_map<size_t, std::vector<size_t>>>();
+    auto graph_mutex = std::make_shared<std::mutex>();
     indegree->reserve(node_map->size());
     children->reserve(node_map->size());
 
@@ -136,6 +155,7 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
                       node_map,
                       indegree,
                       children,
+                      graph_mutex,
                       completed,
                       failed,
                       finished,
@@ -156,6 +176,7 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
                    node_map,
                    indegree,
                    children,
+                   graph_mutex,
                    completed,
                    failed,
                    finished,
@@ -202,14 +223,21 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
                     return;
                 }
 
-                for (const size_t child : children->at(node_id)) {
-                    size_t &child_deg = indegree->at(child);
-                    if (child_deg > 0) {
-                        --child_deg;
-                        if (child_deg == 0) {
-                            (*enqueue_ready)(child);
+                std::vector<size_t> ready_children;
+                {
+                    std::lock_guard<std::mutex> lock(*graph_mutex);
+                    for (const size_t child : children->at(node_id)) {
+                        size_t &child_deg = indegree->at(child);
+                        if (child_deg > 0) {
+                            --child_deg;
+                            if (child_deg == 0) {
+                                ready_children.push_back(child);
+                            }
                         }
                     }
+                }
+                for (const size_t child : ready_children) {
+                    (*enqueue_ready)(child);
                 }
             },
             .enqueued_at = std::chrono::steady_clock::now(),
@@ -228,12 +256,12 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
 
 void Scheduler2::drain() {
     std::unique_lock<std::mutex> lock(mutex_);
-    drain_cv_.wait(lock, [this]() { return queue_.empty() && active_count_ == 0; });
+    drain_cv_.wait(lock, [this]() { return cpu_queue_.empty() && npu_queue_.empty() && active_count_ == 0; });
 }
 
 size_t Scheduler2::pending_count() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return queue_.size();
+    return cpu_queue_.size() + npu_queue_.size();
 }
 
 size_t Scheduler2::active_count() const {
@@ -241,19 +269,44 @@ size_t Scheduler2::active_count() const {
     return active_count_;
 }
 
-void Scheduler2::worker_loop() {
+void Scheduler2::worker_loop(BackendKind worker_backend) {
+    const char *worker_name = (worker_backend == BackendKind::NPU) ? "npu" : "cpu";
     while (true) {
         Scheduler2Task task;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this]() { return shutdown_ || !queue_.empty(); });
+            cv_.wait(lock, [this]() {
+                return shutdown_ || !cpu_queue_.empty() || !npu_queue_.empty();
+            });
 
-            if (shutdown_ && queue_.empty()) {
+            if (shutdown_ && cpu_queue_.empty() && npu_queue_.empty()) {
                 break;
             }
 
-            task = std::move(queue_.front());
-            queue_.pop_front();
+            auto pop_from_queue = [](std::deque<Scheduler2Task> &queue, Scheduler2Task &out) -> bool {
+                if (queue.empty()) {
+                    return false;
+                }
+                out = std::move(queue.front());
+                queue.pop_front();
+                return true;
+            };
+
+            bool popped = false;
+            if (worker_backend == BackendKind::CPU) {
+                popped = pop_from_queue(cpu_queue_, task);
+                if (!popped) {
+                    popped = pop_from_queue(npu_queue_, task); // steal
+                }
+            } else {
+                popped = pop_from_queue(npu_queue_, task);
+                if (!popped) {
+                    popped = pop_from_queue(cpu_queue_, task); // steal
+                }
+            }
+            if (!popped) {
+                continue;
+            }
             ++active_count_;
         }
 
@@ -273,7 +326,8 @@ void Scheduler2::worker_loop() {
             std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()
         );
         POWERSERVE_LOG_DEBUG(
-            "Scheduler2 task done: type={}, request_id={}, backend={}, queue_wait_ms={}, exec_ms={}",
+            "Scheduler2 task done: worker={}, type={}, request_id={}, backend={}, queue_wait_ms={}, exec_ms={}",
+            worker_name,
             scheduler2_task_type_name(task.type),
             task.request_id,
             BackendRouter::backend_name(task.backend),

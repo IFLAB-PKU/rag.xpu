@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <future>
 #include <sstream>
@@ -63,6 +64,17 @@ struct RagStageMetrics {
     size_t total_ms = 0;
 };
 
+struct GenerationSubMetrics {
+    size_t prefill_ms = 0;
+    size_t decode_ms = 0;
+    size_t prefill_sum_ms = 0;
+    size_t decode_sum_ms = 0;
+    size_t bridge_ms = 0;
+    size_t kv_snapshot_ms = 0;
+    size_t kv_restore_ms = 0;
+    size_t kv_snapshot_bytes = 0;
+};
+
 struct DecodeTaskDebugSummary {
     std::string source;
     size_t output_tokens = 0;
@@ -92,6 +104,7 @@ struct RagResponse {
     std::vector<std::string> context_chunks;
     std::vector<size_t> top_k_indices;
     std::vector<size_t> top_n_indices;
+    GenerationSubMetrics generation_sub_metrics;
     RagStageMetrics metrics;
 };
 
@@ -623,7 +636,7 @@ inline std::string maybe_expand_rag_query(
 
 inline void log_rag_stage_metrics(const RagResponse &response) {
     POWERSERVE_LOG_INFO(
-        "rag stage metrics (mode={}): indexing(split+doc_embedding)={}ms, query_expand={}ms, query_embedding={}ms, embedding={}ms, searching={}ms, reranking={}ms, generation={}ms, total={}ms",
+        "rag stage metrics (mode={}): indexing(split+doc_embedding)={}ms, query_expand={}ms, query_embedding={}ms, embedding={}ms, searching={}ms, reranking={}ms, generation={}ms, total={}ms, generation_sub(prefill={}ms, decode={}ms, prefill_sum={}ms, decode_sum={}ms, bridge={}ms, kv_snapshot={}ms, kv_restore={}ms, kv_snapshot_bytes={})",
         response.mode_used,
         response.metrics.indexing_ms,
         response.metrics.query_expand_ms,
@@ -632,7 +645,15 @@ inline void log_rag_stage_metrics(const RagResponse &response) {
         response.metrics.searching_ms,
         response.metrics.reranking_ms,
         response.metrics.generation_ms,
-        response.metrics.total_ms
+        response.metrics.total_ms,
+        response.generation_sub_metrics.prefill_ms,
+        response.generation_sub_metrics.decode_ms,
+        response.generation_sub_metrics.prefill_sum_ms,
+        response.generation_sub_metrics.decode_sum_ms,
+        response.generation_sub_metrics.bridge_ms,
+        response.generation_sub_metrics.kv_snapshot_ms,
+        response.generation_sub_metrics.kv_restore_ms,
+        response.generation_sub_metrics.kv_snapshot_bytes
     );
 }
 
@@ -925,85 +946,15 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     Timer total_timer;
     POWERSERVE_ASSERT(server_context.scheduler2 != nullptr);
+    POWERSERVE_ASSERT(server_context.kv_cache_manager != nullptr);
 
     DocBranchOutput doc_branch;
     QueryBranchOutput query_branch;
-    {
-        std::vector<powerserve::Scheduler2DagNode> dag_nodes;
-        dag_nodes.reserve(2);
-        dag_nodes.push_back({
-            .node_id = 1,
-            .type = powerserve::Scheduler2TaskType::UNKNOWN,
-            .request_id = next_rag_request_id(),
-            .backend = powerserve::BackendKind::CPU,
-            .dependencies = {},
-            .fn = [&]() {
-                DocBranchOutput out;
+    const size_t retrieval_branch_count = request.enable_query_expansion ? 3 : 1;
+    const size_t generation_task_count = request.enable_query_expansion ? 4 : 1;
 
-                Timer stage_timer;
-                out.chunks = rag_split_document(request.doc);
-                const size_t split_ms = stage_timer.elapsed_time_ms();
-                if (out.chunks.empty()) {
-                    throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
-                }
-
-                stage_timer = Timer{};
-                out.doc_embeddings.reserve(out.chunks.size());
-                out.doc_embedding_source_indices.reserve(out.chunks.size());
-                for (size_t chunk_idx = 0; chunk_idx < out.chunks.size(); ++chunk_idx) {
-                    const auto &chunk = out.chunks[chunk_idx];
-                    const ModelOutput doc_embedding_out =
-                        embedding(server_context, make_embedding_input(request.embedding_model, chunk));
-                    if (doc_embedding_out.m_embedding.empty()) {
-                        continue;
-                    }
-                    out.doc_embeddings.push_back(doc_embedding_out.m_embedding);
-                    out.doc_embedding_source_indices.push_back(chunk_idx);
-                }
-                out.doc_embedding_ms = stage_timer.elapsed_time_ms();
-                out.indexing_ms = split_ms + out.doc_embedding_ms;
-
-                if (out.doc_embeddings.empty()) {
-                    throw std::runtime_error("all document embeddings are empty");
-                }
-                doc_branch = std::move(out);
-            },
-            .debug_name = "indexing",
-        });
-        dag_nodes.push_back({
-            .node_id = 2,
-            .type = powerserve::Scheduler2TaskType::UNKNOWN,
-            .request_id = next_rag_request_id(),
-            .backend = powerserve::BackendKind::CPU,
-            .dependencies = {},
-            .fn = [&]() {
-                QueryBranchOutput out;
-                const GenerationRoutePlan route_plan = plan_generation_route(request);
-                out.expanded_query = maybe_expand_rag_query(server_context, request, route_plan, out.query_expand_ms);
-                if (request.enable_query_expansion) {
-                    // Keep Step1-compatible sub-query behavior in parallel mode.
-                    const auto parsed_sub_queries = rag_split_sub_queries(out.expanded_query);
-                    (void)parsed_sub_queries;
-                    out.sub_queries = {
-                        "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
-                        "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
-                        "OpenAI 在安全方面的发展中体现了哪些权衡取舍?"
-                    };
-                }
-                query_branch = std::move(out);
-            },
-            .debug_name = "query_expand",
-        });
-        server_context.scheduler2->submit_dag(std::move(dag_nodes)).get();
-    }
-
-    response.sub_queries = query_branch.sub_queries;
-    response.query_used = request.query;
-
-    const std::vector<std::string> retrieval_queries =
-        response.sub_queries.empty() ? std::vector<std::string>{query_branch.expanded_query} : response.sub_queries;
-    std::vector<std::vector<float>> query_embeddings(retrieval_queries.size());
-    std::vector<std::vector<size_t>> per_query_top_indices(retrieval_queries.size());
+    std::vector<std::vector<float>> query_embeddings(retrieval_branch_count);
+    std::vector<std::vector<size_t>> per_query_top_indices(retrieval_branch_count);
     std::vector<size_t> merged_top_indices;
     std::vector<std::string> top_k_docs;
     std::vector<size_t> top_k_indices_collected;
@@ -1013,110 +964,529 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     std::atomic_size_t query_embedding_ms_acc{0};
     std::atomic_size_t searching_ms_acc{0};
     std::atomic_size_t reranking_ms_acc{0};
+    std::atomic_size_t generation_prefill_ms_acc{0};
+    std::atomic_size_t generation_decode_ms_acc{0};
+    std::atomic_size_t generation_bridge_ms_acc{0};
+    std::atomic_size_t generation_snapshot_ms_acc{0};
+    std::atomic_size_t generation_restore_ms_acc{0};
+    std::atomic_size_t generation_snapshot_bytes_acc{0};
+    std::atomic_long generation_prefill_begin_ms{-1};
+    std::atomic_long generation_prefill_end_ms{-1};
+    std::atomic_long generation_decode_begin_ms{-1};
+    std::atomic_long generation_decode_end_ms{-1};
 
-    {
-        std::vector<powerserve::Scheduler2DagNode> dag_nodes;
-        dag_nodes.reserve(retrieval_queries.size() * 2 + 1);
-        std::vector<size_t> search_node_ids;
-        search_node_ids.reserve(retrieval_queries.size());
+    std::vector<GenerationDecodeTask> generation_tasks(generation_task_count);
+    std::vector<GenerationDecodeCandidate> generation_candidates(generation_task_count);
+    std::vector<ModelInput> generation_inputs(generation_task_count);
+    std::vector<bool> generation_input_ready(generation_task_count, false);
+    std::vector<const ModelContext *> generation_contexts(generation_task_count, nullptr);
+    std::vector<BlockingPrefillResult> prefill_results(generation_task_count);
+    std::vector<std::unique_ptr<powerserve::SamplerChain>> prefill_samplers(generation_task_count);
 
-        for (size_t i = 0; i < retrieval_queries.size(); ++i) {
-            const size_t embedding_node_id = 1000 + i * 2;
-            const size_t searching_node_id = embedding_node_id + 1;
-            search_node_ids.push_back(searching_node_id);
+    bool segmented_prefill_used = false;
+    std::atomic_long generation_start_ms{-1};
 
-            dag_nodes.push_back({
-                .node_id = embedding_node_id,
-                .type = powerserve::Scheduler2TaskType::UNKNOWN,
-                .request_id = next_rag_request_id(),
-                .backend = powerserve::BackendKind::CPU,
-                .dependencies = {},
-                .fn = [&, i]() {
-                    Timer timer;
-                    const ModelOutput query_embedding_out =
-                        embedding(server_context, make_embedding_input(request.embedding_model, retrieval_queries[i]));
-                    if (query_embedding_out.m_embedding.empty()) {
-                        throw std::runtime_error("query embedding is empty");
-                    }
-                    query_embeddings[i] = query_embedding_out.m_embedding;
-                    query_embedding_ms_acc.fetch_add(timer.elapsed_time_ms(), std::memory_order_relaxed);
-                },
-                .debug_name = "query_embedding_" + std::to_string(i + 1),
-            });
+    const bool npu_available =
+#if defined(POWERSERVE_WITH_QNN)
+        true;
+#else
+        false;
+#endif
+    const auto prefill_route = server_context.backend_router.route_for_generation_prefill(
+        generation_route_plan.prefill_backend_target,
+        npu_available
+    );
+    const auto decode_route = server_context.backend_router.route_for_generation_decode(
+        generation_route_plan.decode_backend_target,
+        npu_available
+    );
 
-            dag_nodes.push_back({
-                .node_id = searching_node_id,
-                .type = powerserve::Scheduler2TaskType::UNKNOWN,
-                .request_id = next_rag_request_id(),
-                .backend = powerserve::BackendKind::CPU,
-                .dependencies = {embedding_node_id},
-                .fn = [&, i]() {
-                    Timer timer;
-                    per_query_top_indices[i] = rag_search_faiss_ip(
-                        doc_branch.doc_embeddings,
-                        doc_branch.doc_embedding_source_indices,
-                        query_embeddings[i],
-                        request.top_k
-                    );
-                    searching_ms_acc.fetch_add(timer.elapsed_time_ms(), std::memory_order_relaxed);
-                },
-                .debug_name = "searching_" + std::to_string(i + 1),
-            });
-        }
+    constexpr size_t indexing_node_id = 1;
+    constexpr size_t query_expand_node_id = 2;
+    constexpr size_t reranking_node_id = 9000;
+    constexpr size_t generation_prefill_base_node_id = 20000;
+    constexpr size_t generation_merge_node_id = 26000;
+
+    std::vector<powerserve::Scheduler2DagNode> dag_nodes;
+    dag_nodes.reserve(2 + retrieval_branch_count * 2 + 1 + generation_task_count * 2 + 1);
+
+    dag_nodes.push_back({
+        .node_id = indexing_node_id,
+        .type = powerserve::Scheduler2TaskType::UNKNOWN,
+        .request_id = next_rag_request_id(),
+        .backend = powerserve::BackendKind::CPU,
+        .dependencies = {},
+        .fn = [&]() {
+            DocBranchOutput out;
+
+            Timer stage_timer;
+            out.chunks = rag_split_document(request.doc);
+            const size_t split_ms = stage_timer.elapsed_time_ms();
+            if (out.chunks.empty()) {
+                throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
+            }
+
+            stage_timer = Timer{};
+            out.doc_embeddings.reserve(out.chunks.size());
+            out.doc_embedding_source_indices.reserve(out.chunks.size());
+            for (size_t chunk_idx = 0; chunk_idx < out.chunks.size(); ++chunk_idx) {
+                const auto &chunk = out.chunks[chunk_idx];
+                const ModelOutput doc_embedding_out =
+                    embedding(server_context, make_embedding_input(request.embedding_model, chunk));
+                if (doc_embedding_out.m_embedding.empty()) {
+                    continue;
+                }
+                out.doc_embeddings.push_back(doc_embedding_out.m_embedding);
+                out.doc_embedding_source_indices.push_back(chunk_idx);
+            }
+            out.doc_embedding_ms = stage_timer.elapsed_time_ms();
+            out.indexing_ms = split_ms + out.doc_embedding_ms;
+
+            if (out.doc_embeddings.empty()) {
+                throw std::runtime_error("all document embeddings are empty");
+            }
+            doc_branch = std::move(out);
+        },
+        .debug_name = "indexing",
+    });
+
+    dag_nodes.push_back({
+        .node_id = query_expand_node_id,
+        .type = powerserve::Scheduler2TaskType::UNKNOWN,
+        .request_id = next_rag_request_id(),
+        .backend = powerserve::BackendKind::CPU,
+        .dependencies = {},
+        .fn = [&]() {
+            QueryBranchOutput out;
+            const GenerationRoutePlan route_plan = plan_generation_route(request);
+            out.expanded_query = maybe_expand_rag_query(server_context, request, route_plan, out.query_expand_ms);
+            if (request.enable_query_expansion) {
+                const auto parsed_sub_queries = rag_split_sub_queries(out.expanded_query);
+                (void)parsed_sub_queries;
+                out.sub_queries = {
+                    "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
+                    "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
+                    "OpenAI 在安全方面的发展中体现了哪些权衡取舍?"
+                };
+            }
+            query_branch = std::move(out);
+        },
+        .debug_name = "query_expand",
+    });
+
+    std::vector<size_t> search_node_ids;
+    search_node_ids.reserve(retrieval_branch_count);
+    for (size_t i = 0; i < retrieval_branch_count; ++i) {
+        const size_t embedding_node_id = 1000 + i * 2;
+        const size_t searching_node_id = embedding_node_id + 1;
+        search_node_ids.push_back(searching_node_id);
 
         dag_nodes.push_back({
-            .node_id = 9000,
+            .node_id = embedding_node_id,
             .type = powerserve::Scheduler2TaskType::UNKNOWN,
             .request_id = next_rag_request_id(),
             .backend = powerserve::BackendKind::CPU,
-            .dependencies = search_node_ids,
-            .fn = [&]() {
-                Timer merge_timer;
-                merged_top_indices = rag_merge_subquery_hits(per_query_top_indices, request.top_k);
-                const size_t actual_top_k = merged_top_indices.size();
-                top_k_docs.clear();
-                top_k_indices_collected.clear();
-                top_k_docs.reserve(actual_top_k);
-                top_k_indices_collected.reserve(actual_top_k);
-                for (size_t i = 0; i < actual_top_k; ++i) {
-                    top_k_indices_collected.push_back(merged_top_indices[i]);
-                    top_k_docs.push_back(doc_branch.chunks[merged_top_indices[i]]);
+            .dependencies = {query_expand_node_id},
+            .fn = [&, i]() {
+                Timer timer;
+                const std::string retrieval_query = request.enable_query_expansion
+                    ? query_branch.sub_queries.at(i)
+                    : query_branch.expanded_query;
+                const ModelOutput query_embedding_out =
+                    embedding(server_context, make_embedding_input(request.embedding_model, retrieval_query));
+                if (query_embedding_out.m_embedding.empty()) {
+                    throw std::runtime_error("query embedding is empty");
                 }
-                searching_ms_acc.fetch_add(merge_timer.elapsed_time_ms(), std::memory_order_relaxed);
-
-                if (top_k_docs.empty()) {
-                    throw std::runtime_error("retrieval returns empty top_k docs");
-                }
-
-                Timer rerank_timer;
-                const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
-
-                selected_context.clear();
-                top_n_indices_collected.clear();
-                selected_context.reserve(rerank_out.m_rerank_results.size());
-                top_n_indices_collected.reserve(rerank_out.m_rerank_results.size());
-                for (const auto &item : rerank_out.m_rerank_results) {
-                    if (item.index >= top_k_docs.size()) {
-                        continue;
-                    }
-                    top_n_indices_collected.push_back(top_k_indices_collected[item.index]);
-                    selected_context.push_back(top_k_docs[item.index]);
-                }
-                if (selected_context.empty()) {
-                    const size_t fallback_n = std::min(request.top_n, top_k_docs.size());
-                    for (size_t i = 0; i < fallback_n; ++i) {
-                        top_n_indices_collected.push_back(top_k_indices_collected[i]);
-                        selected_context.push_back(top_k_docs[i]);
-                    }
-                }
-                reranking_ms_acc.store(rerank_timer.elapsed_time_ms(), std::memory_order_relaxed);
+                query_embeddings[i] = query_embedding_out.m_embedding;
+                query_embedding_ms_acc.fetch_add(timer.elapsed_time_ms(), std::memory_order_relaxed);
             },
-            .debug_name = "reranking",
+            .debug_name = "query_embedding_" + std::to_string(i + 1),
         });
 
-        server_context.scheduler2->submit_dag(std::move(dag_nodes)).get();
+        dag_nodes.push_back({
+            .node_id = searching_node_id,
+            .type = powerserve::Scheduler2TaskType::UNKNOWN,
+            .request_id = next_rag_request_id(),
+            .backend = powerserve::BackendKind::CPU,
+            .dependencies = {embedding_node_id, indexing_node_id},
+            .fn = [&, i]() {
+                Timer timer;
+                per_query_top_indices[i] = rag_search_faiss_ip(
+                    doc_branch.doc_embeddings,
+                    doc_branch.doc_embedding_source_indices,
+                    query_embeddings[i],
+                    request.top_k
+                );
+                searching_ms_acc.fetch_add(timer.elapsed_time_ms(), std::memory_order_relaxed);
+            },
+            .debug_name = "searching_" + std::to_string(i + 1),
+        });
     }
 
+    std::vector<size_t> reranking_deps;
+    reranking_deps.reserve(1 + search_node_ids.size());
+    reranking_deps.push_back(indexing_node_id);
+    reranking_deps.insert(reranking_deps.end(), search_node_ids.begin(), search_node_ids.end());
+    dag_nodes.push_back({
+        .node_id = reranking_node_id,
+        .type = powerserve::Scheduler2TaskType::UNKNOWN,
+        .request_id = next_rag_request_id(),
+        .backend = powerserve::BackendKind::CPU,
+        .dependencies = std::move(reranking_deps),
+        .fn = [&]() {
+            Timer merge_timer;
+            merged_top_indices = rag_merge_subquery_hits(per_query_top_indices, request.top_k);
+            const size_t actual_top_k = merged_top_indices.size();
+            top_k_docs.clear();
+            top_k_indices_collected.clear();
+            top_k_docs.reserve(actual_top_k);
+            top_k_indices_collected.reserve(actual_top_k);
+            for (size_t i = 0; i < actual_top_k; ++i) {
+                top_k_indices_collected.push_back(merged_top_indices[i]);
+                top_k_docs.push_back(doc_branch.chunks[merged_top_indices[i]]);
+            }
+            searching_ms_acc.fetch_add(merge_timer.elapsed_time_ms(), std::memory_order_relaxed);
+
+            if (top_k_docs.empty()) {
+                throw std::runtime_error("retrieval returns empty top_k docs");
+            }
+
+            Timer rerank_timer;
+            const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
+
+            selected_context.clear();
+            top_n_indices_collected.clear();
+            selected_context.reserve(rerank_out.m_rerank_results.size());
+            top_n_indices_collected.reserve(rerank_out.m_rerank_results.size());
+            for (const auto &item : rerank_out.m_rerank_results) {
+                if (item.index >= top_k_docs.size()) {
+                    continue;
+                }
+                top_n_indices_collected.push_back(top_k_indices_collected[item.index]);
+                selected_context.push_back(top_k_docs[item.index]);
+            }
+            if (selected_context.empty()) {
+                const size_t fallback_n = std::min(request.top_n, top_k_docs.size());
+                for (size_t i = 0; i < fallback_n; ++i) {
+                    top_n_indices_collected.push_back(top_k_indices_collected[i]);
+                    selected_context.push_back(top_k_docs[i]);
+                }
+            }
+            reranking_ms_acc.store(rerank_timer.elapsed_time_ms(), std::memory_order_relaxed);
+
+            generation_tasks = build_generation_decode_tasks(
+                request.query,
+                query_branch.sub_queries,
+                selected_context,
+                request.generation_decode_steps
+            );
+            if (generation_tasks.size() != generation_task_count) {
+                throw std::runtime_error("generation task count mismatch while building big dag");
+            }
+            for (size_t i = 0; i < generation_task_count; ++i) {
+                const std::string task_prompt = generation_tasks[i].input_segments.empty()
+                    ? build_generation_prompt(request.query, selected_context)
+                    : generation_tasks[i].input_segments.front();
+                ModelInput generation_input = make_generation_input(request, task_prompt);
+                apply_generation_route_to_input(generation_input, generation_route_plan);
+                generation_contexts[i] = &server_context.setup_model_for_blocking_pd(generation_input);
+                generation_inputs[i] = std::move(generation_input);
+                generation_input_ready[i] = true;
+            }
+        },
+        .debug_name = "reranking",
+    });
+
+    std::vector<size_t> generation_decode_node_ids;
+    generation_decode_node_ids.reserve(generation_task_count);
+    for (size_t i = 0; i < generation_task_count; ++i) {
+        const size_t prefill_node_id = generation_prefill_base_node_id + i * 2;
+        const size_t decode_node_id = prefill_node_id + 1;
+        const size_t prev_decode_node_id = (i == 0) ? 0 : (generation_prefill_base_node_id + (i - 1) * 2 + 1);
+        generation_decode_node_ids.push_back(decode_node_id);
+
+        std::vector<size_t> prefill_dependencies = {reranking_node_id};
+        // Conservative guard: keep each candidate's prefill/decode pair contiguous on shared KV.
+        if (i > 0) {
+            prefill_dependencies.push_back(prev_decode_node_id);
+        }
+
+        dag_nodes.push_back({
+            .node_id = prefill_node_id,
+            .type = powerserve::Scheduler2TaskType::GENERATION_PREFILL,
+            .request_id = next_rag_request_id(),
+            .backend = prefill_route.backend,
+            .dependencies = std::move(prefill_dependencies),
+            .fn = [&, i]() {
+                Timer prefill_timer;
+                const long now_ms = static_cast<long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()
+                    ).count()
+                );
+                long expected = -1;
+                (void)generation_start_ms.compare_exchange_strong(expected, now_ms);
+                expected = -1;
+                (void)generation_prefill_begin_ms.compare_exchange_strong(expected, now_ms);
+
+                POWERSERVE_ASSERT(generation_contexts[i] != nullptr);
+                const ModelContext &context = *generation_contexts[i];
+                const ModelInput &input = generation_inputs[i];
+                const GenerationDecodeTask &decode_task = generation_tasks[i];
+                const auto &tokenizer = *context.m_tokenizer_ptr;
+                auto model_exec_lock = lock_model_execution(context);
+
+                auto sampler_config = context.m_config.hyper_params.sampler_config;
+                sampler_config.temperature = input.m_temperature;
+                sampler_config.penalty_freq = input.m_frequency_penalty;
+                sampler_config.penalty_present = input.m_presence_penalty;
+                sampler_config.penalty_repeat = input.m_repeat_penalty;
+                sampler_config.top_p = input.m_top_p;
+                prefill_samplers[i] = std::make_unique<powerserve::SamplerChain>(sampler_config, tokenizer);
+                POWERSERVE_ASSERT(prefill_samplers[i] != nullptr);
+
+                POWERSERVE_LOG_DEBUG(
+                    "scheduler2 dag prefill start: request_id={}, backend={}",
+                    input.request_id,
+                    BackendRouter::backend_name(prefill_route.backend)
+                );
+                if (input.m_generation_route_enabled) {
+                    if (!set_generation_backend_route(context, BackendRouter::backend_name(prefill_route.backend))) {
+                        POWERSERVE_LOG_WARN(
+                            "scheduler2 dag prefill backend route fallback to cpu, request_id={}, target={}",
+                            input.request_id,
+                            input.m_generation_prefill_backend_target
+                        );
+                        (void)set_generation_backend_route(context, "cpu");
+                    }
+                }
+
+                std::string model_id = context.m_model_ptr->m_config->model_id;
+                const size_t kv_position_begin = context.m_model_ptr->m_platform->get_kv_position(model_id);
+                BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
+                    context,
+                    input,
+                    decode_task.input_segments,
+                    *prefill_samplers[i]
+                );
+                PrefillArtifact artifact = build_prefill_artifact(context, input, prefill_result, kv_position_begin);
+                server_context.kv_cache_manager->put({
+                    .request_id = artifact.request_id,
+                    .model_id = artifact.model_id,
+                    .producer_backend = BackendRouter::backend_name(prefill_route.backend),
+                    .kv_begin = artifact.kv_position_begin,
+                    .kv_end = artifact.kv_position_end,
+                    .prefill_tokens_total = artifact.prefill_tokens_total,
+                });
+
+                prefill_results[i] = std::move(prefill_result);
+                generation_prefill_ms_acc.fetch_add(prefill_timer.elapsed_time_ms(), std::memory_order_relaxed);
+                const long prefill_end_ms = static_cast<long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()
+                    ).count()
+                );
+                long previous_prefill_end = generation_prefill_end_ms.load(std::memory_order_relaxed);
+                while (previous_prefill_end < prefill_end_ms &&
+                       !generation_prefill_end_ms.compare_exchange_weak(
+                           previous_prefill_end,
+                           prefill_end_ms,
+                           std::memory_order_relaxed,
+                           std::memory_order_relaxed
+                       )) {
+                }
+                POWERSERVE_LOG_DEBUG(
+                    "scheduler2 dag prefill end: request_id={}, backend={}",
+                    input.request_id,
+                    BackendRouter::backend_name(prefill_route.backend)
+                );
+            },
+            .debug_name = "generation_prefill_" + std::to_string(i),
+        });
+
+        dag_nodes.push_back({
+            .node_id = decode_node_id,
+            .type = powerserve::Scheduler2TaskType::GENERATION_DECODE,
+            .request_id = next_rag_request_id(),
+            .backend = decode_route.backend,
+            .dependencies = {prefill_node_id},
+            .fn = [&, i]() {
+                Timer decode_timer;
+                const long decode_begin_ms = static_cast<long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()
+                    ).count()
+                );
+                long expected = -1;
+                (void)generation_decode_begin_ms.compare_exchange_strong(expected, decode_begin_ms);
+                POWERSERVE_ASSERT(generation_contexts[i] != nullptr);
+                const ModelContext &context = *generation_contexts[i];
+                const ModelInput &input = generation_inputs[i];
+                const GenerationDecodeTask &decode_task = generation_tasks[i];
+                const auto cache_record = server_context.kv_cache_manager->get(input.request_id);
+                if (!cache_record.has_value()) {
+                    throw std::runtime_error("scheduler2 dag missing kv cache record for decode");
+                }
+                if (cache_record->producer_backend == "npu" && decode_route.backend == BackendKind::CPU) {
+                    Timer bridge_timer;
+                    const bool bridged = server_context.kv_cache_manager->bridge_to_cpu(input.request_id);
+                    const size_t bridge_ms = bridge_timer.elapsed_time_ms();
+                    generation_bridge_ms_acc.fetch_add(bridge_ms, std::memory_order_relaxed);
+                    if (bridged) {
+                        POWERSERVE_LOG_INFO(
+                            "scheduler2 dag kv bridge hook: request_id={}, prefill_backend=npu, decode_backend=cpu",
+                            input.request_id
+                        );
+                    } else {
+                        POWERSERVE_LOG_WARN("scheduler2 dag kv bridge hook failed: request_id={}", input.request_id);
+                    }
+                }
+
+                try {
+                    const auto &tokenizer = *context.m_tokenizer_ptr;
+                    auto model_exec_lock = lock_model_execution(context);
+                    POWERSERVE_LOG_DEBUG(
+                        "scheduler2 dag decode start: request_id={}, backend={}",
+                        input.request_id,
+                        BackendRouter::backend_name(decode_route.backend)
+                    );
+
+                    if (input.m_generation_route_enabled) {
+                        if (!set_generation_backend_route(context, BackendRouter::backend_name(decode_route.backend))) {
+                            POWERSERVE_LOG_WARN(
+                                "scheduler2 dag decode backend route fallback to cpu, request_id={}, target={}",
+                                input.request_id,
+                                input.m_generation_decode_backend_target
+                            );
+                            (void)set_generation_backend_route(context, "cpu");
+                        }
+                    }
+
+                    LocalDecodeExecutor decode_executor;
+                    generation_candidates[i] = run_blocking_decode_task_from_artifact(
+                        decode_executor,
+                        input,
+                        tokenizer,
+                        prefill_results[i],
+                        decode_task
+                    );
+
+                    prefill_samplers[i].reset();
+                    server_context.kv_cache_manager->release(input.request_id);
+                    generation_decode_ms_acc.fetch_add(decode_timer.elapsed_time_ms(), std::memory_order_relaxed);
+                    const long decode_end_ms = static_cast<long>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()
+                        ).count()
+                    );
+                    long previous_decode_end = generation_decode_end_ms.load(std::memory_order_relaxed);
+                    while (previous_decode_end < decode_end_ms &&
+                           !generation_decode_end_ms.compare_exchange_weak(
+                               previous_decode_end,
+                               decode_end_ms,
+                               std::memory_order_relaxed,
+                               std::memory_order_relaxed
+                           )) {
+                    }
+                    POWERSERVE_LOG_DEBUG(
+                        "scheduler2 dag decode end: request_id={}, backend={}",
+                        input.request_id,
+                        BackendRouter::backend_name(decode_route.backend)
+                    );
+                } catch (...) {
+                    prefill_samplers[i].reset();
+                    server_context.kv_cache_manager->release(input.request_id);
+                    throw;
+                }
+            },
+            .debug_name = "generation_decode_" + std::to_string(i),
+        });
+    }
+
+    dag_nodes.push_back({
+        .node_id = generation_merge_node_id,
+        .type = powerserve::Scheduler2TaskType::UNKNOWN,
+        .request_id = next_rag_request_id(),
+        .backend = powerserve::BackendKind::CPU,
+        .dependencies = generation_decode_node_ids,
+        .fn = [&]() {
+            const GenerationMergeResult merge_result = merge_generation_candidates_v1(generation_candidates);
+            const GenerationDecodeCandidate &selected_candidate = generation_candidates.at(merge_result.selected_candidate_idx);
+            response.answer = selected_candidate.output.m_text;
+            response.generation_prefill_queue_wait_ms = 0;
+            for (const auto &candidate : generation_candidates) {
+                response.generation_prefill_queue_wait_ms += candidate.queue_wait_ms;
+            }
+            response.decode_task_count = generation_tasks.size();
+            response.candidate_count = generation_candidates.size();
+            response.selected_answer_source = merge_result.selected_source;
+            response.merge_policy_version = merge_result.merge_policy_version;
+
+            response.decode_task_summaries.clear();
+            response.decode_task_summaries.reserve(generation_candidates.size());
+            for (const auto &candidate : generation_candidates) {
+                std::string preview = candidate.output.m_text;
+                constexpr size_t kMaxPreviewChars = 200;
+                if (preview.size() > kMaxPreviewChars) {
+                    preview.resize(kMaxPreviewChars);
+                    remove_incomplete_utf8_char(preview);
+                }
+                response.decode_task_summaries.push_back({
+                    .source = candidate.source,
+                    .output_tokens = candidate.output.m_output_num_token > 1 ? candidate.output.m_output_num_token - 1 : 0,
+                    .output_chars = candidate.output.m_text.size(),
+                    .stop_reason = candidate.output.m_stop_reason.value_or("unknown"),
+                    .text_preview = std::move(preview),
+                });
+            }
+            segmented_prefill_used = true;
+        },
+        .debug_name = "generation_merge",
+    });
+
+    size_t edge_count = 0;
+    for (const auto &node : dag_nodes) {
+        edge_count += node.dependencies.size();
+    }
+    POWERSERVE_LOG_INFO("Scheduler2 submit big dag: nodes={}, edges={}", dag_nodes.size(), edge_count);
+
+    try {
+        server_context.scheduler2->submit_dag(std::move(dag_nodes)).get();
+    } catch (...) {
+        for (size_t i = 0; i < prefill_samplers.size(); ++i) {
+            prefill_samplers[i].reset();
+            if (generation_input_ready[i]) {
+                server_context.kv_cache_manager->release(generation_inputs[i].request_id);
+            }
+        }
+        if (!selected_context.empty()) {
+            const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
+            ModelInput fallback_generation_input = make_generation_input(request, generation_prompt);
+            apply_generation_route_to_input(fallback_generation_input, generation_route_plan);
+            const ModelOutput generation_out = completion(server_context, fallback_generation_input);
+            response.answer = generation_out.m_text;
+            response.decode_task_count = 1;
+            response.selected_answer_source = "original";
+            response.candidate_count = 1;
+            response.merge_policy_version = "v1-rule";
+            response.decode_task_summaries = {
+                DecodeTaskDebugSummary{
+                    .source = "original",
+                    .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
+                    .output_chars = generation_out.m_text.size(),
+                    .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
+                    .text_preview = generation_out.m_text,
+                }
+            };
+            response.generation_decode_steps =
+                generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
+        } else {
+            throw;
+        }
+    }
+
+    response.sub_queries = query_branch.sub_queries;
+    response.query_used = request.query;
     response.metrics.indexing_ms = doc_branch.indexing_ms;
     response.metrics.query_expand_ms = query_branch.query_expand_ms;
     response.metrics.query_embedding_ms = query_embedding_ms_acc.load(std::memory_order_relaxed);
@@ -1126,255 +1496,22 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     response.top_k_indices = std::move(top_k_indices_collected);
     response.top_n_indices = std::move(top_n_indices_collected);
 
-    // Generation
-    Timer stage_timer;
-    stage_timer = Timer{};
-    const std::vector<GenerationDecodeTask> generation_tasks = build_generation_decode_tasks(
-        request.query,
-        response.sub_queries,
-        selected_context,
-        request.generation_decode_steps
-    );
-
-    std::vector<GenerationDecodeCandidate> generation_candidates(generation_tasks.size());
-    std::vector<ModelInput> generation_inputs;
-    generation_inputs.reserve(generation_tasks.size());
-    std::vector<const ModelContext *> generation_contexts;
-    generation_contexts.reserve(generation_tasks.size());
-    std::vector<BlockingPrefillResult> prefill_results(generation_tasks.size());
-    std::vector<std::unique_ptr<powerserve::SamplerChain>> prefill_samplers(generation_tasks.size());
-    std::vector<bool> prefill_ready(generation_tasks.size(), false);
-
-    bool segmented_prefill_used = false;
-    try {
-        for (const auto &task : generation_tasks) {
-            const std::string task_prompt = task.input_segments.empty()
-                ? build_generation_prompt(request.query, selected_context)
-                : task.input_segments.front();
-
-            ModelInput generation_input = make_generation_input(request, task_prompt);
-            apply_generation_route_to_input(generation_input, generation_route_plan);
-            generation_contexts.push_back(&server_context.setup_model_for_blocking_pd(generation_input));
-            generation_inputs.push_back(std::move(generation_input));
-        }
-
-        const bool npu_available =
-#if defined(POWERSERVE_WITH_QNN)
-            true;
-#else
-            false;
-#endif
-
-        std::vector<powerserve::Scheduler2DagNode> generation_dag_nodes;
-        generation_dag_nodes.reserve(generation_tasks.size() * 2);
-        size_t previous_decode_node_id = 0;
-        bool has_previous_decode_node = false;
-        for (size_t i = 0; i < generation_tasks.size(); ++i) {
-            const auto prefill_route = server_context.backend_router.route_for_generation_prefill(
-                generation_inputs[i].m_generation_prefill_backend_target,
-                npu_available
-            );
-            const auto decode_route = server_context.backend_router.route_for_generation_decode(
-                generation_inputs[i].m_generation_decode_backend_target,
-                npu_available
-            );
-
-            const size_t prefill_node_id = 20000 + i * 2;
-            const size_t decode_node_id = prefill_node_id + 1;
-            std::vector<size_t> prefill_dependencies;
-            if (has_previous_decode_node) {
-                // Keep each prefill/decode pair contiguous to avoid prefill iterator/KV state
-                // being overwritten by later prefills before its decode starts.
-                prefill_dependencies.push_back(previous_decode_node_id);
-            }
-            generation_dag_nodes.push_back({
-                .node_id = prefill_node_id,
-                .type = powerserve::Scheduler2TaskType::GENERATION_PREFILL,
-                .request_id = generation_inputs[i].request_id,
-                .backend = prefill_route.backend,
-                .dependencies = std::move(prefill_dependencies),
-                .fn = [&, i, prefill_route]() {
-                    const ModelContext &context = *generation_contexts[i];
-                    const ModelInput &input = generation_inputs[i];
-                    const GenerationDecodeTask &decode_task = generation_tasks[i];
-                    const auto &tokenizer = *context.m_tokenizer_ptr;
-                    auto model_exec_lock = lock_model_execution(context);
-
-                    auto sampler_config = context.m_config.hyper_params.sampler_config;
-                    sampler_config.temperature = input.m_temperature;
-                    sampler_config.penalty_freq = input.m_frequency_penalty;
-                    sampler_config.penalty_present = input.m_presence_penalty;
-                    sampler_config.penalty_repeat = input.m_repeat_penalty;
-                    sampler_config.top_p = input.m_top_p;
-                    prefill_samplers[i] = std::make_unique<powerserve::SamplerChain>(sampler_config, tokenizer);
-                    POWERSERVE_ASSERT(prefill_samplers[i] != nullptr);
-
-                    if (input.m_generation_route_enabled) {
-                        if (!set_generation_backend_route(context, BackendRouter::backend_name(prefill_route.backend))) {
-                            POWERSERVE_LOG_WARN(
-                                "scheduler2 dag prefill backend route fallback to cpu, request_id={}, target={}",
-                                input.request_id,
-                                input.m_generation_prefill_backend_target
-                            );
-                            (void)set_generation_backend_route(context, "cpu");
-                        }
-                    }
-
-                    std::string model_id = context.m_model_ptr->m_config->model_id;
-                    const size_t kv_position_begin = context.m_model_ptr->m_platform->get_kv_position(model_id);
-                    BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
-                        context,
-                        input,
-                        decode_task.input_segments,
-                        *prefill_samplers[i]
-                    );
-                    PrefillArtifact artifact = build_prefill_artifact(context, input, prefill_result, kv_position_begin);
-                    server_context.kv_cache_manager->put({
-                        .request_id = artifact.request_id,
-                        .model_id = artifact.model_id,
-                        .producer_backend = BackendRouter::backend_name(prefill_route.backend),
-                        .kv_begin = artifact.kv_position_begin,
-                        .kv_end = artifact.kv_position_end,
-                        .prefill_tokens_total = artifact.prefill_tokens_total,
-                    });
-                    prefill_results[i] = std::move(prefill_result);
-                    prefill_ready[i] = true;
-                },
-                .debug_name = "generation_prefill_" + std::to_string(i),
-            });
-
-            generation_dag_nodes.push_back({
-                .node_id = decode_node_id,
-                .type = powerserve::Scheduler2TaskType::GENERATION_DECODE,
-                .request_id = generation_inputs[i].request_id,
-                .backend = decode_route.backend,
-                .dependencies = {prefill_node_id},
-                .fn = [&, i, decode_route]() {
-                    if (!prefill_ready[i]) {
-                        throw std::runtime_error("scheduler2 dag decode missing prefill result");
-                    }
-                    const ModelContext &context = *generation_contexts[i];
-                    const ModelInput &input = generation_inputs[i];
-                    const GenerationDecodeTask &decode_task = generation_tasks[i];
-                    const auto cache_record = server_context.kv_cache_manager->get(input.request_id);
-                    if (!cache_record.has_value()) {
-                        throw std::runtime_error("scheduler2 dag missing kv cache record for decode");
-                    }
-                    if (cache_record->producer_backend == "npu" && decode_route.backend == BackendKind::CPU) {
-                        const bool bridged = server_context.kv_cache_manager->bridge_to_cpu(input.request_id);
-                        if (bridged) {
-                            POWERSERVE_LOG_INFO(
-                                "scheduler2 dag kv bridge hook: request_id={}, prefill_backend=npu, decode_backend=cpu",
-                                input.request_id
-                            );
-                        } else {
-                            POWERSERVE_LOG_WARN("scheduler2 dag kv bridge hook failed: request_id={}", input.request_id);
-                        }
-                    }
-
-                    try {
-                        const auto &tokenizer = *context.m_tokenizer_ptr;
-                        auto model_exec_lock = lock_model_execution(context);
-                        POWERSERVE_LOG_DEBUG(
-                            "scheduler2 dag decode start: request_id={}, backend={}",
-                            input.request_id,
-                            BackendRouter::backend_name(decode_route.backend)
-                        );
-
-                        if (input.m_generation_route_enabled) {
-                            if (!set_generation_backend_route(context, BackendRouter::backend_name(decode_route.backend))) {
-                                POWERSERVE_LOG_WARN(
-                                    "scheduler2 dag decode backend route fallback to cpu, request_id={}, target={}",
-                                    input.request_id,
-                                    input.m_generation_decode_backend_target
-                                );
-                                (void)set_generation_backend_route(context, "cpu");
-                            }
-                        }
-
-                        LocalDecodeExecutor decode_executor;
-                        generation_candidates[i] = run_blocking_decode_task_from_artifact(
-                            decode_executor,
-                            input,
-                            tokenizer,
-                            prefill_results[i],
-                            decode_task
-                        );
-                        prefill_samplers[i].reset();
-                        server_context.kv_cache_manager->release(input.request_id);
-                    } catch (...) {
-                        prefill_samplers[i].reset();
-                        server_context.kv_cache_manager->release(input.request_id);
-                        throw;
-                    }
-                },
-                .debug_name = "generation_decode_" + std::to_string(i),
-            });
-            previous_decode_node_id = decode_node_id;
-            has_previous_decode_node = true;
-        }
-
-        server_context.scheduler2->submit_dag(std::move(generation_dag_nodes)).get();
-
-        const GenerationMergeResult merge_result = merge_generation_candidates_v1(generation_candidates);
-        const GenerationDecodeCandidate &selected_candidate = generation_candidates.at(merge_result.selected_candidate_idx);
-        response.answer = selected_candidate.output.m_text;
-        response.generation_prefill_queue_wait_ms = 0;
-        for (const auto &candidate : generation_candidates) {
-            response.generation_prefill_queue_wait_ms += candidate.queue_wait_ms;
-        }
-        response.decode_task_count = generation_tasks.size();
-        response.candidate_count = generation_candidates.size();
-        response.selected_answer_source = merge_result.selected_source;
-        response.merge_policy_version = merge_result.merge_policy_version;
-
-        response.decode_task_summaries.clear();
-        response.decode_task_summaries.reserve(generation_candidates.size());
-        for (const auto &candidate : generation_candidates) {
-            std::string preview = candidate.output.m_text;
-            constexpr size_t kMaxPreviewChars = 200;
-            if (preview.size() > kMaxPreviewChars) {
-                preview.resize(kMaxPreviewChars);
-                remove_incomplete_utf8_char(preview);
-            }
-            response.decode_task_summaries.push_back({
-                .source = candidate.source,
-                .output_tokens = candidate.output.m_output_num_token > 1 ? candidate.output.m_output_num_token - 1 : 0,
-                .output_chars = candidate.output.m_text.size(),
-                .stop_reason = candidate.output.m_stop_reason.value_or("unknown"),
-                .text_preview = std::move(preview),
-            });
-        }
-
-        segmented_prefill_used = true;
-    } catch (...) {
-        for (size_t i = 0; i < prefill_samplers.size(); ++i) {
-            prefill_samplers[i].reset();
-        }
-        for (const auto &input : generation_inputs) {
-            server_context.kv_cache_manager->release(input.request_id);
-        }
-        const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
-        ModelInput fallback_generation_input = make_generation_input(request, generation_prompt);
-        apply_generation_route_to_input(fallback_generation_input, generation_route_plan);
-        const ModelOutput generation_out = completion(server_context, fallback_generation_input);
-        response.answer = generation_out.m_text;
-        response.decode_task_count = 1;
-        response.selected_answer_source = "original";
-        response.candidate_count = 1;
-        response.merge_policy_version = "v1-rule";
-        response.decode_task_summaries = {
-            DecodeTaskDebugSummary{
-                .source = "original",
-                .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
-                .output_chars = generation_out.m_text.size(),
-                .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
-                .text_preview = generation_out.m_text,
-            }
-        };
-        response.generation_decode_steps =
-            generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
-    }
+    response.generation_sub_metrics.prefill_sum_ms = generation_prefill_ms_acc.load(std::memory_order_relaxed);
+    response.generation_sub_metrics.decode_sum_ms = generation_decode_ms_acc.load(std::memory_order_relaxed);
+    const long prefill_begin_ms = generation_prefill_begin_ms.load(std::memory_order_relaxed);
+    const long prefill_end_ms = generation_prefill_end_ms.load(std::memory_order_relaxed);
+    response.generation_sub_metrics.prefill_ms = (prefill_begin_ms >= 0 && prefill_end_ms >= prefill_begin_ms)
+        ? static_cast<size_t>(prefill_end_ms - prefill_begin_ms)
+        : 0;
+    const long decode_begin_ms = generation_decode_begin_ms.load(std::memory_order_relaxed);
+    const long decode_end_ms = generation_decode_end_ms.load(std::memory_order_relaxed);
+    response.generation_sub_metrics.decode_ms = (decode_begin_ms >= 0 && decode_end_ms >= decode_begin_ms)
+        ? static_cast<size_t>(decode_end_ms - decode_begin_ms)
+        : 0;
+    response.generation_sub_metrics.bridge_ms = generation_bridge_ms_acc.load(std::memory_order_relaxed);
+    response.generation_sub_metrics.kv_snapshot_ms = generation_snapshot_ms_acc.load(std::memory_order_relaxed);
+    response.generation_sub_metrics.kv_restore_ms = generation_restore_ms_acc.load(std::memory_order_relaxed);
+    response.generation_sub_metrics.kv_snapshot_bytes = generation_snapshot_bytes_acc.load(std::memory_order_relaxed);
 
     response.generation_segmented_prefill_used = segmented_prefill_used;
     if (segmented_prefill_used && !generation_candidates.empty()) {
@@ -1392,8 +1529,18 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     }
 
     response.context_chunks = std::move(selected_context);
-    response.metrics.generation_ms = stage_timer.elapsed_time_ms();
-
+    const long generation_begin_ms = generation_start_ms.load(std::memory_order_relaxed);
+    if (generation_begin_ms >= 0) {
+        const long now_ms = static_cast<long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count()
+        );
+        response.metrics.generation_ms = static_cast<size_t>(std::max<long>(0, now_ms - generation_begin_ms));
+    } else {
+        response.metrics.generation_ms =
+            response.generation_sub_metrics.prefill_ms + response.generation_sub_metrics.decode_ms;
+    }
     response.metrics.total_ms = total_timer.elapsed_time_ms();
     log_rag_stage_metrics(response);
     return response;

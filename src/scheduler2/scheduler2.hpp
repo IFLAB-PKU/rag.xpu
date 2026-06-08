@@ -81,16 +81,18 @@ public:
     size_t active_count() const;
 
 private:
-    std::deque<Scheduler2Task> queue_;
+    std::deque<Scheduler2Task> cpu_queue_;
+    std::deque<Scheduler2Task> npu_queue_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::condition_variable drain_cv_;
-    std::thread worker_;
+    std::thread worker_cpu_;
+    std::thread worker_npu_;
     bool shutdown_ = false;
     size_t active_count_ = 0;
 
     void enqueue_task(Scheduler2Task task);
-    void worker_loop();
+    void worker_loop(BackendKind worker_backend);
 };
 
 } // namespace powerserve
