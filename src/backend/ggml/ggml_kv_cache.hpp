@@ -160,11 +160,13 @@ public:
 
 public:
     struct Snapshot {
+        size_t begin_position = 0;
         size_t position = 0;
         KVBuffer key_buffer;
         KVBuffer value_buffer;
     };
 
+    auto save_snapshot(size_t begin_position, size_t end_position) const -> std::unique_ptr<Snapshot>;
     auto save_snapshot() const -> std::unique_ptr<Snapshot>;
     void restore_snapshot(const Snapshot &snapshot);
 

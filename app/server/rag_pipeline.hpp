@@ -982,6 +982,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     std::vector<const ModelContext *> generation_contexts(generation_task_count, nullptr);
     std::vector<BlockingPrefillResult> prefill_results(generation_task_count);
     std::vector<std::unique_ptr<powerserve::SamplerChain>> prefill_samplers(generation_task_count);
+    std::vector<std::unique_ptr<powerserve::ggml::GGMLKV::Snapshot>> prefill_kv_snapshots(generation_task_count);
 
     bool segmented_prefill_used = false;
     std::atomic_long generation_start_ms{-1};
@@ -1202,21 +1203,14 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     for (size_t i = 0; i < generation_task_count; ++i) {
         const size_t prefill_node_id = generation_prefill_base_node_id + i * 2;
         const size_t decode_node_id = prefill_node_id + 1;
-        const size_t prev_decode_node_id = (i == 0) ? 0 : (generation_prefill_base_node_id + (i - 1) * 2 + 1);
         generation_decode_node_ids.push_back(decode_node_id);
-
-        std::vector<size_t> prefill_dependencies = {reranking_node_id};
-        // Conservative guard: keep each candidate's prefill/decode pair contiguous on shared KV.
-        if (i > 0) {
-            prefill_dependencies.push_back(prev_decode_node_id);
-        }
 
         dag_nodes.push_back({
             .node_id = prefill_node_id,
             .type = powerserve::Scheduler2TaskType::GENERATION_PREFILL,
             .request_id = next_rag_request_id(),
             .backend = prefill_route.backend,
-            .dependencies = std::move(prefill_dependencies),
+            .dependencies = {reranking_node_id},
             .fn = [&, i]() {
                 Timer prefill_timer;
                 const long now_ms = static_cast<long>(
@@ -1278,6 +1272,35 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                     .kv_end = artifact.kv_position_end,
                     .prefill_tokens_total = artifact.prefill_tokens_total,
                 });
+
+                if (decode_route.backend == BackendKind::CPU) {
+                    auto ggml_iter = context.m_model_ptr->m_platform->ggml_backends.find(artifact.model_id);
+                    POWERSERVE_ASSERT(ggml_iter != context.m_model_ptr->m_platform->ggml_backends.end());
+                    POWERSERVE_ASSERT(ggml_iter->second && ggml_iter->second->m_kv);
+
+                    Timer snapshot_timer;
+                    // Keep prefix-safe snapshot semantics while reducing copy size to valid tokens.
+                    prefill_kv_snapshots[i] = ggml_iter->second->m_kv->save_snapshot(0, artifact.kv_position_end);
+                    const size_t snapshot_ms = snapshot_timer.elapsed_time_ms();
+                    size_t snapshot_bytes = 0;
+                    if (prefill_kv_snapshots[i] != nullptr) {
+                        for (const auto &buf : prefill_kv_snapshots[i]->key_buffer) {
+                            snapshot_bytes += buf.size() * sizeof(float);
+                        }
+                        for (const auto &buf : prefill_kv_snapshots[i]->value_buffer) {
+                            snapshot_bytes += buf.size() * sizeof(float);
+                        }
+                    }
+                    generation_snapshot_ms_acc.fetch_add(snapshot_ms, std::memory_order_relaxed);
+                    generation_snapshot_bytes_acc.fetch_add(snapshot_bytes, std::memory_order_relaxed);
+                    POWERSERVE_LOG_INFO(
+                        "scheduler2 dag kv snapshot: request_id={}, copied_tokens={}, bytes={}, cost_ms={}",
+                        input.request_id,
+                        artifact.kv_position_end,
+                        snapshot_bytes,
+                        snapshot_ms
+                    );
+                }
 
                 prefill_results[i] = std::move(prefill_result);
                 generation_prefill_ms_acc.fetch_add(prefill_timer.elapsed_time_ms(), std::memory_order_relaxed);
@@ -1362,16 +1385,59 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                         }
                     }
 
-                    LocalDecodeExecutor decode_executor;
-                    generation_candidates[i] = run_blocking_decode_task_from_artifact(
-                        decode_executor,
-                        input,
-                        tokenizer,
-                        prefill_results[i],
-                        decode_task
-                    );
+                    std::unique_ptr<powerserve::ggml::GGMLKV> private_ggml_kv;
+                    if (decode_route.backend == BackendKind::CPU) {
+                        if (prefill_kv_snapshots[i] == nullptr) {
+                            throw std::runtime_error("scheduler2 dag decode missing kv snapshot");
+                        }
+                        auto ggml_iter = context.m_model_ptr->m_platform->ggml_backends.find(cache_record->model_id);
+                        POWERSERVE_ASSERT(ggml_iter != context.m_model_ptr->m_platform->ggml_backends.end());
+                        POWERSERVE_ASSERT(ggml_iter->second && ggml_iter->second->m_kv);
+
+                        private_ggml_kv = std::make_unique<powerserve::ggml::GGMLKV>(ggml_iter->second->m_kv->m_config);
+                        Timer restore_timer;
+                        private_ggml_kv->restore_snapshot(*prefill_kv_snapshots[i]);
+                        const size_t restore_ms = restore_timer.elapsed_time_ms();
+                        generation_restore_ms_acc.fetch_add(restore_ms, std::memory_order_relaxed);
+
+                        powerserve::KVCacheInterface *cpu_kv = get_cpu_kv_cache_for_route(context);
+                        context.m_model_ptr->kv_cache = private_ggml_kv->kv_cache.get();
+                        context.m_model_ptr->ggml_kv_override = private_ggml_kv.get();
+                        struct GgmlKvOverrideGuard {
+                            powerserve::Model *model = nullptr;
+                            powerserve::KVCacheInterface *cpu_kv = nullptr;
+                            ~GgmlKvOverrideGuard() {
+                                if (model != nullptr) {
+                                    model->ggml_kv_override = nullptr;
+                                    if (cpu_kv != nullptr) {
+                                        model->kv_cache = cpu_kv;
+                                    }
+                                }
+                            }
+                        } kv_guard{context.m_model_ptr.get(), cpu_kv};
+                        (void)kv_guard;
+
+                        LocalDecodeExecutor decode_executor;
+                        generation_candidates[i] = run_blocking_decode_task_from_artifact(
+                            decode_executor,
+                            input,
+                            tokenizer,
+                            prefill_results[i],
+                            decode_task
+                        );
+                    } else {
+                        LocalDecodeExecutor decode_executor;
+                        generation_candidates[i] = run_blocking_decode_task_from_artifact(
+                            decode_executor,
+                            input,
+                            tokenizer,
+                            prefill_results[i],
+                            decode_task
+                        );
+                    }
 
                     prefill_samplers[i].reset();
+                    prefill_kv_snapshots[i].reset();
                     server_context.kv_cache_manager->release(input.request_id);
                     generation_decode_ms_acc.fetch_add(decode_timer.elapsed_time_ms(), std::memory_order_relaxed);
                     const long decode_end_ms = static_cast<long>(
@@ -1395,6 +1461,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                     );
                 } catch (...) {
                     prefill_samplers[i].reset();
+                    prefill_kv_snapshots[i].reset();
                     server_context.kv_cache_manager->release(input.request_id);
                     throw;
                 }
@@ -1455,6 +1522,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     } catch (...) {
         for (size_t i = 0; i < prefill_samplers.size(); ++i) {
             prefill_samplers[i].reset();
+            prefill_kv_snapshots[i].reset();
             if (generation_input_ready[i]) {
                 server_context.kv_cache_manager->release(generation_inputs[i].request_id);
             }

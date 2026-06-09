@@ -69,29 +69,100 @@ void GGMLKV::prepare_model_chunk() {
 }
 
 auto GGMLKV::save_snapshot() const -> std::unique_ptr<Snapshot> {
+    return save_snapshot(0, kv_cache->position);
+}
+
+auto GGMLKV::save_snapshot(size_t begin_position, size_t end_position) const -> std::unique_ptr<Snapshot> {
+    POWERSERVE_ASSERT(begin_position <= end_position);
+    POWERSERVE_ASSERT(end_position <= kv_cache->position);
+    POWERSERVE_ASSERT(end_position <= m_n_ctx);
+
     auto snapshot = std::make_unique<Snapshot>();
+    snapshot->begin_position = begin_position;
     snapshot->position = kv_cache->position;
     snapshot->key_buffer.resize(m_n_layers);
     snapshot->value_buffer.resize(m_n_layers);
-    size_t layer_size = m_kv_dim * m_n_ctx;
+    const size_t token_count = end_position - begin_position;
+    const size_t key_layer_size = token_count * m_kv_dim;
+    const size_t value_layer_size = token_count * m_kv_dim;
     for (size_t L = 0; L < m_n_layers; L++) {
-        snapshot->key_buffer[L].resize(layer_size);
-        snapshot->value_buffer[L].resize(layer_size);
-        std::memcpy(snapshot->key_buffer[L].data(), chunk.key_buffer[L].data(), layer_size * sizeof(float));
-        std::memcpy(snapshot->value_buffer[L].data(), chunk.value_buffer[L].data(), layer_size * sizeof(float));
+        auto &dst_key = snapshot->key_buffer[L];
+        auto &dst_value = snapshot->value_buffer[L];
+        dst_key.resize(key_layer_size);
+        dst_value.resize(value_layer_size);
+        if (token_count == 0) {
+            continue;
+        }
+
+        // key_buffer layout is token-major contiguous: [token][kv_dim]
+        const float *key_src = chunk.key_buffer[L].data() + begin_position * m_kv_dim;
+        std::memcpy(dst_key.data(), key_src, key_layer_size * sizeof(float));
+
+        // value_buffer layout is [head][head_size][n_ctx], token dimension is strided by n_ctx.
+        // Copy through KV views to preserve the exact memory layout.
+        size_t dst_flat = 0;
+        for (size_t token = begin_position; token < end_position; ++token) {
+            for (size_t head = 0; head < m_n_kv_heads; ++head) {
+                const auto view = kv_cache->value_entry({
+                    .layer_id = L,
+                    .head_id = head,
+                    .index = token,
+                });
+                POWERSERVE_ASSERT(view.element_size == sizeof(float));
+                for (size_t i = 0; i < view.n_elements; ++i) {
+                    const auto *src_ptr = reinterpret_cast<const float *>(
+                        static_cast<const char *>(view.data) + i * view.stride
+                    );
+                    dst_value[dst_flat++] = *src_ptr;
+                }
+            }
+        }
+        POWERSERVE_ASSERT(dst_flat == value_layer_size);
     }
     return snapshot;
 }
 
 void GGMLKV::restore_snapshot(const Snapshot &snapshot) {
+    POWERSERVE_ASSERT(snapshot.begin_position <= snapshot.position);
+    POWERSERVE_ASSERT(snapshot.position <= m_n_ctx);
     POWERSERVE_ASSERT(snapshot.key_buffer.size() == m_n_layers);
     POWERSERVE_ASSERT(snapshot.value_buffer.size() == m_n_layers);
-    size_t layer_size = m_kv_dim * m_n_ctx;
+    const size_t token_count = snapshot.position - snapshot.begin_position;
+    const size_t key_layer_size = token_count * m_kv_dim;
+    const size_t value_layer_size = token_count * m_kv_dim;
     for (size_t L = 0; L < m_n_layers; L++) {
-        POWERSERVE_ASSERT(snapshot.key_buffer[L].size() == layer_size);
-        POWERSERVE_ASSERT(snapshot.value_buffer[L].size() == layer_size);
-        std::memcpy(chunk.key_buffer[L].data(), snapshot.key_buffer[L].data(), layer_size * sizeof(float));
-        std::memcpy(chunk.value_buffer[L].data(), snapshot.value_buffer[L].data(), layer_size * sizeof(float));
+        const auto &src_key = snapshot.key_buffer[L];
+        const auto &src_value = snapshot.value_buffer[L];
+        POWERSERVE_ASSERT(src_key.size() == key_layer_size);
+        POWERSERVE_ASSERT(src_value.size() == value_layer_size);
+        if (token_count == 0) {
+            continue;
+        }
+
+        // key_buffer layout is token-major contiguous: [token][kv_dim]
+        float *key_dst = chunk.key_buffer[L].data() + snapshot.begin_position * m_kv_dim;
+        std::memcpy(key_dst, src_key.data(), key_layer_size * sizeof(float));
+
+        // value_buffer layout is [head][head_size][n_ctx], token dimension is strided by n_ctx.
+        // Restore through KV views to keep the layout correct.
+        size_t src_flat = 0;
+        for (size_t token = snapshot.begin_position; token < snapshot.position; ++token) {
+            for (size_t head = 0; head < m_n_kv_heads; ++head) {
+                const auto view = kv_cache->value_entry({
+                    .layer_id = L,
+                    .head_id = head,
+                    .index = token,
+                });
+                POWERSERVE_ASSERT(view.element_size == sizeof(float));
+                for (size_t i = 0; i < view.n_elements; ++i) {
+                    auto *dst_ptr = reinterpret_cast<float *>(
+                        static_cast<char *>(view.data) + i * view.stride
+                    );
+                    *dst_ptr = src_value[src_flat++];
+                }
+            }
+        }
+        POWERSERVE_ASSERT(src_flat == value_layer_size);
     }
     kv_cache->position = snapshot.position;
 }
