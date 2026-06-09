@@ -79,7 +79,9 @@ auto GGMLKV::save_snapshot(size_t begin_position, size_t end_position) const -> 
 
     auto snapshot = std::make_unique<Snapshot>();
     snapshot->begin_position = begin_position;
-    snapshot->position = kv_cache->position;
+    // For partial snapshots, `position` is the end of the captured interval.
+    // Full snapshot still uses [0, kv_cache->position) via save_snapshot().
+    snapshot->position = end_position;
     snapshot->key_buffer.resize(m_n_layers);
     snapshot->value_buffer.resize(m_n_layers);
     const size_t token_count = end_position - begin_position;

@@ -983,6 +983,8 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     std::vector<BlockingPrefillResult> prefill_results(generation_task_count);
     std::vector<std::unique_ptr<powerserve::SamplerChain>> prefill_samplers(generation_task_count);
     std::vector<std::unique_ptr<powerserve::ggml::GGMLKV::Snapshot>> prefill_kv_snapshots(generation_task_count);
+    std::mutex kv_base_snapshot_lock;
+    std::unordered_map<std::string, std::shared_ptr<powerserve::ggml::GGMLKV::Snapshot>> kv_base_snapshots;
 
     bool segmented_prefill_used = false;
     std::atomic_long generation_start_ms{-1};
@@ -1279,24 +1281,78 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                     POWERSERVE_ASSERT(ggml_iter->second && ggml_iter->second->m_kv);
 
                     Timer snapshot_timer;
-                    // Keep prefix-safe snapshot semantics while reducing copy size to valid tokens.
-                    prefill_kv_snapshots[i] = ggml_iter->second->m_kv->save_snapshot(0, artifact.kv_position_end);
-                    const size_t snapshot_ms = snapshot_timer.elapsed_time_ms();
+                    // Two-stage snapshot:
+                    // 1) cache shared base [0, kv_begin) once per model
+                    // 2) snapshot per-candidate delta [kv_begin, kv_end)
                     size_t snapshot_bytes = 0;
-                    if (prefill_kv_snapshots[i] != nullptr) {
-                        for (const auto &buf : prefill_kv_snapshots[i]->key_buffer) {
-                            snapshot_bytes += buf.size() * sizeof(float);
+                    const auto calc_snapshot_bytes = [](const powerserve::ggml::GGMLKV::Snapshot &snapshot) -> size_t {
+                        size_t bytes = 0;
+                        for (const auto &buf : snapshot.key_buffer) {
+                            bytes += buf.size() * sizeof(float);
                         }
-                        for (const auto &buf : prefill_kv_snapshots[i]->value_buffer) {
-                            snapshot_bytes += buf.size() * sizeof(float);
+                        for (const auto &buf : snapshot.value_buffer) {
+                            bytes += buf.size() * sizeof(float);
+                        }
+                        return bytes;
+                    };
+                    const auto make_base_snapshot_key = [](const std::string &model_id, size_t begin) {
+                        return model_id + "#" + std::to_string(begin);
+                    };
+
+                    size_t kv_begin = artifact.kv_position_begin;
+                    const size_t kv_end = artifact.kv_position_end;
+                    if (kv_begin > kv_end) {
+                        POWERSERVE_LOG_WARN(
+                            "scheduler2 dag kv snapshot begin>end, clamp to end: request_id={}, begin={}, end={}",
+                            input.request_id,
+                            kv_begin,
+                            kv_end
+                        );
+                        kv_begin = kv_end;
+                    }
+                    const std::string base_snapshot_key = make_base_snapshot_key(artifact.model_id, kv_begin);
+                    if (kv_begin > 0) {
+                        bool need_base_snapshot = false;
+                        {
+                            std::lock_guard<std::mutex> lock_guard(kv_base_snapshot_lock);
+                            const auto iter = kv_base_snapshots.find(base_snapshot_key);
+                            if (iter == kv_base_snapshots.end() || !iter->second) {
+                                need_base_snapshot = true;
+                            }
+                        }
+                        if (need_base_snapshot) {
+                            auto base_snapshot = ggml_iter->second->m_kv->save_snapshot(0, kv_begin);
+                            POWERSERVE_ASSERT(base_snapshot != nullptr);
+                            const size_t base_bytes = calc_snapshot_bytes(*base_snapshot);
+                            snapshot_bytes += base_bytes;
+                            {
+                                std::lock_guard<std::mutex> lock_guard(kv_base_snapshot_lock);
+                                auto &slot = kv_base_snapshots[base_snapshot_key];
+                                if (!slot) {
+                                    slot = std::shared_ptr<powerserve::ggml::GGMLKV::Snapshot>(base_snapshot.release());
+                                    POWERSERVE_LOG_INFO(
+                                        "scheduler2 dag kv base snapshot: model_id={}, base_tokens={}, bytes={}",
+                                        artifact.model_id,
+                                        kv_begin,
+                                        base_bytes
+                                    );
+                                }
+                            }
                         }
                     }
+
+                    prefill_kv_snapshots[i] = ggml_iter->second->m_kv->save_snapshot(kv_begin, kv_end);
+                    POWERSERVE_ASSERT(prefill_kv_snapshots[i] != nullptr);
+                    snapshot_bytes += calc_snapshot_bytes(*prefill_kv_snapshots[i]);
+                    const size_t snapshot_ms = snapshot_timer.elapsed_time_ms();
                     generation_snapshot_ms_acc.fetch_add(snapshot_ms, std::memory_order_relaxed);
                     generation_snapshot_bytes_acc.fetch_add(snapshot_bytes, std::memory_order_relaxed);
                     POWERSERVE_LOG_INFO(
-                        "scheduler2 dag kv snapshot: request_id={}, copied_tokens={}, bytes={}, cost_ms={}",
+                        "scheduler2 dag kv snapshot: request_id={}, begin={}, end={}, copied_tokens={}, bytes={}, cost_ms={}",
                         input.request_id,
-                        artifact.kv_position_end,
+                        kv_begin,
+                        kv_end,
+                        kv_end >= kv_begin ? (kv_end - kv_begin) : 0,
                         snapshot_bytes,
                         snapshot_ms
                     );
@@ -1395,6 +1451,23 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                         POWERSERVE_ASSERT(ggml_iter->second && ggml_iter->second->m_kv);
 
                         private_ggml_kv = std::make_unique<powerserve::ggml::GGMLKV>(ggml_iter->second->m_kv->m_config);
+                        if (prefill_kv_snapshots[i]->begin_position > 0) {
+                            std::shared_ptr<powerserve::ggml::GGMLKV::Snapshot> base_snapshot;
+                            {
+                                std::lock_guard<std::mutex> lock_guard(kv_base_snapshot_lock);
+                                const std::string base_snapshot_key =
+                                    cache_record->model_id + "#" +
+                                    std::to_string(prefill_kv_snapshots[i]->begin_position);
+                                auto iter = kv_base_snapshots.find(base_snapshot_key);
+                                if (iter != kv_base_snapshots.end()) {
+                                    base_snapshot = iter->second;
+                                }
+                            }
+                            if (!base_snapshot) {
+                                throw std::runtime_error("scheduler2 dag decode missing kv base snapshot");
+                            }
+                            private_ggml_kv->restore_snapshot(*base_snapshot);
+                        }
                         Timer restore_timer;
                         private_ggml_kv->restore_snapshot(*prefill_kv_snapshots[i]);
                         const size_t restore_ms = restore_timer.elapsed_time_ms();
