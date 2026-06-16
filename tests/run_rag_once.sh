@@ -57,6 +57,11 @@ case "$PROFILE" in
     GEN_PREFILL_BACKEND="npu"
     GEN_DECODE_BACKEND="cpu"
     ;;
+  npu_cpu_baseline|hetero_npu_cpu_baseline|carrier_baseline)
+    MODE="carrier_baseline"
+    GEN_PREFILL_BACKEND="npu"
+    GEN_DECODE_BACKEND="cpu"
+    ;;
   -h|--help|help)
     cat <<'EOF2'
 Usage:
@@ -66,17 +71,19 @@ Profiles:
   pure_cpu_sequential  prefill=cpu, decode=cpu, mode=sequential
   pure_npu_sequential  prefill=npu, decode=npu, mode=sequential
   npu_cpu              prefill=npu, decode=cpu, mode=hetero_parallel
+  npu_cpu_baseline     prefill=npu, decode=cpu, mode=carrier_baseline
 
 Examples:
   ./tests/run_rag_once.sh pure_cpu_sequential 8gen5
   ./tests/run_rag_once.sh pure_npu_sequential 8gen4
   ./tests/run_rag_once.sh npu_cpu 8gen5
+  ./tests/run_rag_once.sh npu_cpu_baseline 8gen4
 EOF2
     exit 0
     ;;
   *)
     echo "unknown profile: $PROFILE" >&2
-    echo "try: pure_cpu_sequential | pure_npu_sequential | npu_cpu" >&2
+    echo "try: pure_cpu_sequential | pure_npu_sequential | npu_cpu | npu_cpu_baseline" >&2
     exit 2
     ;;
 esac
@@ -151,3 +158,4 @@ echo "serial: $SERIAL"
 # ./tests/run_rag_once.sh pure_cpu_sequential 8gen5
 # ./tests/run_rag_once.sh pure_npu_sequential 8gen4
 # ./tests/run_rag_once.sh npu_cpu 8gen5
+# ./tests/run_rag_once.sh npu_cpu_baseline 8gen4

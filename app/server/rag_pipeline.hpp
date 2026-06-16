@@ -48,6 +48,7 @@ struct RagRequest {
     size_t top_n = 5;
     size_t max_tokens = 128;
     size_t generation_decode_steps = 64;
+    size_t generation_candidate_repeats = 1;
     std::string generation_prefill_backend = "auto";
     std::string generation_decode_backend = "auto";
     float temperature = 0.2F;
@@ -93,6 +94,7 @@ struct RagResponse {
     size_t generation_prefill_queue_wait_ms = 0;
     size_t generation_decode_steps = 0;
     size_t decode_task_count = 0;
+    size_t generation_candidate_repeats = 1;
     std::string selected_answer_source;
     size_t candidate_count = 0;
     std::string merge_policy_version;
@@ -510,10 +512,12 @@ inline std::vector<GenerationDecodeTask> build_generation_decode_tasks(
     const std::string &query,
     const std::vector<std::string> &sub_queries,
     const std::vector<std::string> &context_chunks,
-    size_t max_decode_steps
+    size_t max_decode_steps,
+    size_t candidate_repeats = 1
 ) {
     std::vector<GenerationDecodeTask> tasks;
-    tasks.reserve(1 + sub_queries.size());
+    candidate_repeats = std::max<size_t>(candidate_repeats, 1);
+    tasks.reserve(1 + sub_queries.size() * candidate_repeats);
 
     GenerationDecodeTask original_task;
     original_task.query_type = "original";
@@ -521,12 +525,14 @@ inline std::vector<GenerationDecodeTask> build_generation_decode_tasks(
     original_task.input_segments = build_generation_segments(query, sub_queries, context_chunks);
     tasks.push_back(std::move(original_task));
 
-    for (const auto &sub_query : sub_queries) {
-        GenerationDecodeTask task;
-        task.query_type = "subquery";
-        task.max_decode_steps = max_decode_steps;
-        task.input_segments = build_generation_segments(sub_query, {}, context_chunks);
-        tasks.push_back(std::move(task));
+    for (size_t repeat = 0; repeat < candidate_repeats; ++repeat) {
+        for (const auto &sub_query : sub_queries) {
+            GenerationDecodeTask task;
+            task.query_type = "subquery";
+            task.max_decode_steps = max_decode_steps;
+            task.input_segments = build_generation_segments(sub_query, {}, context_chunks);
+            tasks.push_back(std::move(task));
+        }
     }
 
     return tasks;
@@ -674,6 +680,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     response.mode_requested = request.mode;
     response.mode_used = request.mode == "hetero_parallel" ? "sequential" : request.mode;
     response.query_used = request.query;
+    response.generation_candidate_repeats = request.generation_candidate_repeats;
     const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
     response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
     response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
@@ -806,7 +813,8 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         request.query,
         response.sub_queries,
         selected_context,
-        request.generation_decode_steps
+        request.generation_decode_steps,
+        request.generation_candidate_repeats
     );
 
     std::vector<GenerationDecodeCandidate> generation_candidates;
@@ -907,6 +915,420 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     return response;
 }
 
+inline RagResponse run_rag_compute_carrier_baseline(ServerContext &server_context, const RagRequest &request) {
+    using namespace powerserve;
+
+    if (request.doc.empty()) {
+        throw std::invalid_argument("'doc' must not be empty");
+    }
+    if (request.query.empty()) {
+        throw std::invalid_argument("'query' must not be empty");
+    }
+    if (request.generation_model.empty() || request.embedding_model.empty() || request.rerank_model.empty()) {
+        throw std::invalid_argument("'generation_model', 'embedding_model', and 'rerank_model' are required");
+    }
+
+    struct DocBranchOutput {
+        std::vector<std::string> chunks;
+        std::vector<std::vector<float>> doc_embeddings;
+        std::vector<size_t> doc_embedding_source_indices;
+        size_t indexing_ms = 0;
+        size_t doc_embedding_ms = 0;
+    };
+
+    struct QueryBranchOutput {
+        std::string expanded_query;
+        std::vector<std::string> sub_queries;
+        size_t query_expand_ms = 0;
+    };
+
+    RagResponse response;
+    response.mode_requested = request.mode;
+    response.mode_used = "carrier_baseline";
+    response.query_used = request.query;
+    response.generation_candidate_repeats = request.generation_candidate_repeats;
+    const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
+    response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
+    response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
+    response.generation_kv_bridge_available = generation_route_plan.kv_bridge_available;
+    response.generation_route_note = generation_route_plan.route_note;
+
+    Timer total_timer;
+    POWERSERVE_LOG_INFO(
+        "compute carrier baseline start: mode={}, prefill_backend={}, decode_backend={}",
+        response.mode_used,
+        response.generation_prefill_backend_target,
+        response.generation_decode_backend_target
+    );
+
+    auto doc_branch_future = std::async(std::launch::async, [&server_context, &request]() -> DocBranchOutput {
+        POWERSERVE_LOG_INFO("compute carrier baseline doc branch start");
+        DocBranchOutput out;
+
+        Timer stage_timer;
+        out.chunks = rag_split_document(request.doc);
+        const size_t split_ms = stage_timer.elapsed_time_ms();
+        if (out.chunks.empty()) {
+            throw std::invalid_argument("'doc' does not contain valid chunks after indexing");
+        }
+
+        stage_timer = Timer{};
+        out.doc_embeddings.reserve(out.chunks.size());
+        out.doc_embedding_source_indices.reserve(out.chunks.size());
+        for (size_t chunk_idx = 0; chunk_idx < out.chunks.size(); ++chunk_idx) {
+            const auto &chunk = out.chunks[chunk_idx];
+            const ModelOutput doc_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, chunk));
+            if (doc_embedding_out.m_embedding.empty()) {
+                continue;
+            }
+            out.doc_embeddings.push_back(doc_embedding_out.m_embedding);
+            out.doc_embedding_source_indices.push_back(chunk_idx);
+        }
+        out.doc_embedding_ms = stage_timer.elapsed_time_ms();
+        out.indexing_ms = split_ms + out.doc_embedding_ms;
+
+        if (out.doc_embeddings.empty()) {
+            throw std::runtime_error("all document embeddings are empty");
+        }
+        POWERSERVE_LOG_INFO(
+            "compute carrier baseline doc branch end: chunks={}, doc_embeddings={}",
+            out.chunks.size(),
+            out.doc_embeddings.size()
+        );
+        return out;
+    });
+
+    auto query_branch_future =
+        std::async(std::launch::async, [&server_context, &request, generation_route_plan]() -> QueryBranchOutput {
+            POWERSERVE_LOG_INFO("compute carrier baseline query branch start");
+            QueryBranchOutput out;
+            out.expanded_query = maybe_expand_rag_query(server_context, request, generation_route_plan, out.query_expand_ms);
+            if (request.enable_query_expansion) {
+                const auto parsed_sub_queries = rag_split_sub_queries(out.expanded_query);
+                (void)parsed_sub_queries;
+                out.sub_queries = {
+                    "OpenAI 在技术方面的发展中体现了哪些权衡取舍?",
+                    "OpenAI 在商业方面的发展中体现了哪些权衡取舍?",
+                    "OpenAI 在安全方面的发展中体现了哪些权衡取舍?"
+                };
+            }
+            POWERSERVE_LOG_INFO(
+                "compute carrier baseline query branch end: sub_queries={}",
+                out.sub_queries.size()
+            );
+            return out;
+        });
+
+    const QueryBranchOutput query_branch = query_branch_future.get();
+    response.sub_queries = query_branch.sub_queries;
+    response.query_used = request.query;
+
+    const std::vector<std::string> retrieval_queries =
+        response.sub_queries.empty() ? std::vector<std::string>{query_branch.expanded_query} : response.sub_queries;
+
+    Timer stage_timer;
+    Timer query_embedding_timer;
+    std::vector<std::vector<float>> query_embeddings;
+    query_embeddings.reserve(retrieval_queries.size());
+    for (const auto &sub_query : retrieval_queries) {
+        const ModelOutput query_embedding_out = embedding(server_context, make_embedding_input(request.embedding_model, sub_query));
+        if (query_embedding_out.m_embedding.empty()) {
+            continue;
+        }
+        query_embeddings.push_back(query_embedding_out.m_embedding);
+    }
+
+    const DocBranchOutput doc_branch = doc_branch_future.get();
+
+    response.metrics.query_embedding_ms = query_embedding_timer.elapsed_time_ms();
+    if (query_embeddings.empty()) {
+        throw std::runtime_error("all query embeddings are empty");
+    }
+
+    response.metrics.indexing_ms = doc_branch.indexing_ms;
+    response.metrics.query_expand_ms = query_branch.query_expand_ms;
+    response.metrics.embedding_ms = doc_branch.doc_embedding_ms + response.metrics.query_embedding_ms;
+
+    stage_timer = Timer{};
+    std::vector<std::vector<size_t>> per_query_top_indices;
+    per_query_top_indices.reserve(query_embeddings.size());
+    for (const auto &query_embedding : query_embeddings) {
+        per_query_top_indices.push_back(rag_search_faiss_ip(
+            doc_branch.doc_embeddings,
+            doc_branch.doc_embedding_source_indices,
+            query_embedding,
+            request.top_k
+        ));
+    }
+    const std::vector<size_t> merged_top_indices = rag_merge_subquery_hits(per_query_top_indices, request.top_k);
+
+    const size_t actual_top_k = merged_top_indices.size();
+    std::vector<std::string> top_k_docs;
+    top_k_docs.reserve(actual_top_k);
+    for (size_t i = 0; i < actual_top_k; ++i) {
+        response.top_k_indices.push_back(merged_top_indices[i]);
+        top_k_docs.push_back(doc_branch.chunks[merged_top_indices[i]]);
+    }
+    response.metrics.searching_ms = stage_timer.elapsed_time_ms();
+    if (top_k_docs.empty()) {
+        throw std::runtime_error("retrieval returns empty top_k docs");
+    }
+
+    stage_timer = Timer{};
+    const ModelOutput rerank_out = rerank(server_context, make_rerank_input(request, request.query, top_k_docs));
+
+    std::vector<std::string> selected_context;
+    for (const auto &item : rerank_out.m_rerank_results) {
+        if (item.index >= top_k_docs.size()) {
+            continue;
+        }
+        response.top_n_indices.push_back(response.top_k_indices[item.index]);
+        selected_context.push_back(top_k_docs[item.index]);
+    }
+
+    if (selected_context.empty()) {
+        const size_t fallback_n = std::min(request.top_n, top_k_docs.size());
+        for (size_t i = 0; i < fallback_n; ++i) {
+            response.top_n_indices.push_back(response.top_k_indices[i]);
+            selected_context.push_back(top_k_docs[i]);
+        }
+    }
+    response.metrics.reranking_ms = stage_timer.elapsed_time_ms();
+
+    stage_timer = Timer{};
+    const std::vector<GenerationDecodeTask> generation_tasks = build_generation_decode_tasks(
+        request.query,
+        response.sub_queries,
+        selected_context,
+        request.generation_decode_steps,
+        request.generation_candidate_repeats
+    );
+
+    std::vector<GenerationDecodeCandidate> generation_candidates;
+    generation_candidates.reserve(generation_tasks.size());
+    size_t generation_prefill_sum_ms = 0;
+    size_t generation_decode_sum_ms = 0;
+    size_t generation_bridge_ms = 0;
+    bool segmented_prefill_used = false;
+
+    try {
+        for (size_t i = 0; i < generation_tasks.size(); ++i) {
+            const auto &task = generation_tasks[i];
+            POWERSERVE_LOG_INFO(
+                "compute carrier baseline generation candidate start: idx={}, source={}",
+                i,
+                task.query_type
+            );
+            const std::string task_prompt = task.input_segments.empty()
+                ? build_generation_prompt(request.query, selected_context)
+                : task.input_segments.front();
+
+            ModelInput generation_input = make_generation_input(request, task_prompt);
+            apply_generation_route_to_input(generation_input, generation_route_plan);
+            const ModelContext &generation_context = server_context.setup_model_for_blocking_pd(generation_input);
+            const auto &tokenizer = *generation_context.m_tokenizer_ptr;
+            auto model_exec_lock = lock_model_execution(generation_context);
+
+            auto sampler_config = generation_context.m_config.hyper_params.sampler_config;
+            sampler_config.temperature = generation_input.m_temperature;
+            sampler_config.penalty_freq = generation_input.m_frequency_penalty;
+            sampler_config.penalty_present = generation_input.m_presence_penalty;
+            sampler_config.penalty_repeat = generation_input.m_repeat_penalty;
+            sampler_config.top_p = generation_input.m_top_p;
+            powerserve::SamplerChain sampler{sampler_config, tokenizer};
+            std::string prefill_backend_used = generation_route_plan.prefill_backend_target;
+            std::string decode_backend_used = generation_route_plan.decode_backend_target;
+
+            if (generation_input.m_generation_route_enabled) {
+                if (!set_generation_backend_route(generation_context, generation_route_plan.prefill_backend_target)) {
+                    POWERSERVE_LOG_WARN(
+                        "compute carrier baseline prefill backend route fallback to cpu, request_id={}, target={}",
+                        generation_input.request_id,
+                        generation_input.m_generation_prefill_backend_target
+                    );
+                    (void)set_generation_backend_route(generation_context, "cpu");
+                    prefill_backend_used = "cpu";
+                }
+            }
+
+            std::string model_id = generation_context.m_model_ptr->m_config->model_id;
+            const size_t kv_position_begin = generation_context.m_model_ptr->m_platform->get_kv_position(model_id);
+            BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
+                generation_context,
+                generation_input,
+                task.input_segments,
+                sampler
+            );
+            generation_prefill_sum_ms += prefill_result.prefill_time_ms;
+
+            bool kv_record_created = false;
+            if (server_context.kv_cache_manager != nullptr) {
+                PrefillArtifact artifact = build_prefill_artifact(
+                    generation_context,
+                    generation_input,
+                    prefill_result,
+                    kv_position_begin
+                );
+                server_context.kv_cache_manager->put({
+                    .request_id = artifact.request_id,
+                    .model_id = artifact.model_id,
+                    .producer_backend = prefill_backend_used,
+                    .kv_begin = artifact.kv_position_begin,
+                    .kv_end = artifact.kv_position_end,
+                    .prefill_tokens_total = artifact.prefill_tokens_total,
+                });
+                kv_record_created = true;
+            }
+
+            try {
+                if (generation_input.m_generation_route_enabled) {
+                    if (!set_generation_backend_route(generation_context, generation_route_plan.decode_backend_target)) {
+                        POWERSERVE_LOG_WARN(
+                            "compute carrier baseline decode backend route fallback to cpu, request_id={}, target={}",
+                            generation_input.request_id,
+                            generation_input.m_generation_decode_backend_target
+                        );
+                        (void)set_generation_backend_route(generation_context, "cpu");
+                        decode_backend_used = "cpu";
+                    }
+                }
+
+                if (prefill_backend_used == "npu" &&
+                    decode_backend_used == "cpu" &&
+                    server_context.kv_cache_manager != nullptr) {
+                    Timer bridge_timer;
+                    const bool bridged = server_context.kv_cache_manager->bridge_to_cpu(generation_input.request_id);
+                    const size_t bridge_ms = bridge_timer.elapsed_time_ms();
+                    generation_bridge_ms += bridge_ms;
+                    if (bridged) {
+                        POWERSERVE_LOG_INFO(
+                            "compute carrier baseline kv bridge hook: request_id={}, prefill_backend=npu, decode_backend=cpu",
+                            generation_input.request_id
+                        );
+                    } else {
+                        POWERSERVE_LOG_WARN(
+                            "compute carrier baseline kv bridge hook failed: request_id={}",
+                            generation_input.request_id
+                        );
+                    }
+                }
+
+                LocalDecodeExecutor decode_executor;
+                Timer decode_timer;
+                GenerationDecodeCandidate candidate = run_blocking_decode_task_from_artifact(
+                    decode_executor,
+                    generation_input,
+                    tokenizer,
+                    prefill_result,
+                    task
+                );
+                generation_decode_sum_ms += decode_timer.elapsed_time_ms();
+                generation_candidates.push_back(std::move(candidate));
+                if (kv_record_created && server_context.kv_cache_manager != nullptr) {
+                    server_context.kv_cache_manager->release(generation_input.request_id);
+                    kv_record_created = false;
+                }
+            } catch (...) {
+                if (kv_record_created && server_context.kv_cache_manager != nullptr) {
+                    server_context.kv_cache_manager->release(generation_input.request_id);
+                }
+                throw;
+            }
+
+            POWERSERVE_LOG_INFO(
+                "compute carrier baseline generation candidate end: idx={}, source={}",
+                i,
+                task.query_type
+            );
+        }
+
+        const GenerationMergeResult merge_result = merge_generation_candidates_v1(generation_candidates);
+        const GenerationDecodeCandidate &selected_candidate = generation_candidates.at(merge_result.selected_candidate_idx);
+        response.answer = selected_candidate.output.m_text;
+        response.generation_prefill_queue_wait_ms = 0;
+        for (const auto &candidate : generation_candidates) {
+            response.generation_prefill_queue_wait_ms += candidate.queue_wait_ms;
+        }
+        response.decode_task_count = generation_tasks.size();
+        response.candidate_count = generation_candidates.size();
+        response.selected_answer_source = merge_result.selected_source;
+        response.merge_policy_version = merge_result.merge_policy_version;
+        response.decode_task_summaries.clear();
+        response.decode_task_summaries.reserve(generation_candidates.size());
+        for (const auto &candidate : generation_candidates) {
+            std::string preview = candidate.output.m_text;
+            constexpr size_t kMaxPreviewChars = 200;
+            if (preview.size() > kMaxPreviewChars) {
+                preview.resize(kMaxPreviewChars);
+                remove_incomplete_utf8_char(preview);
+            }
+            response.decode_task_summaries.push_back({
+                .source = candidate.source,
+                .output_tokens = candidate.output.m_output_num_token > 1 ? candidate.output.m_output_num_token - 1 : 0,
+                .output_chars = candidate.output.m_text.size(),
+                .stop_reason = candidate.output.m_stop_reason.value_or("unknown"),
+                .text_preview = std::move(preview),
+            });
+        }
+
+        segmented_prefill_used = true;
+    } catch (...) {
+        const std::string generation_prompt = build_generation_prompt(request.query, selected_context);
+        ModelInput fallback_generation_input = make_generation_input(request, generation_prompt);
+        apply_generation_route_to_input(fallback_generation_input, generation_route_plan);
+        const ModelOutput generation_out = completion(server_context, fallback_generation_input);
+        response.answer = generation_out.m_text;
+        response.decode_task_count = 1;
+        response.selected_answer_source = "original";
+        response.candidate_count = 1;
+        response.merge_policy_version = "v1-rule";
+        response.decode_task_summaries = {
+            DecodeTaskDebugSummary{
+                .source = "original",
+                .output_tokens = generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0,
+                .output_chars = generation_out.m_text.size(),
+                .stop_reason = generation_out.m_stop_reason.value_or("unknown"),
+                .text_preview = generation_out.m_text,
+            }
+        };
+
+        response.generation_decode_steps =
+            generation_out.m_output_num_token > 1 ? generation_out.m_output_num_token - 1 : 0;
+    }
+
+    response.generation_sub_metrics.prefill_sum_ms = generation_prefill_sum_ms;
+    response.generation_sub_metrics.decode_sum_ms = generation_decode_sum_ms;
+    response.generation_sub_metrics.prefill_ms = generation_prefill_sum_ms;
+    response.generation_sub_metrics.decode_ms = generation_decode_sum_ms;
+    response.generation_sub_metrics.bridge_ms = generation_bridge_ms;
+    response.generation_sub_metrics.kv_snapshot_ms = 0;
+    response.generation_sub_metrics.kv_restore_ms = 0;
+    response.generation_sub_metrics.kv_snapshot_bytes = 0;
+
+    response.generation_segmented_prefill_used = segmented_prefill_used;
+    if (segmented_prefill_used && !generation_candidates.empty()) {
+        size_t selected_candidate_idx = 0;
+        for (size_t i = 0; i < generation_candidates.size(); ++i) {
+            if (generation_candidates[i].source == response.selected_answer_source) {
+                selected_candidate_idx = i;
+                break;
+            }
+        }
+        response.generation_decode_steps =
+            generation_candidates[selected_candidate_idx].output.m_output_num_token > 1
+            ? generation_candidates[selected_candidate_idx].output.m_output_num_token - 1
+            : 0;
+    }
+
+    response.context_chunks = std::move(selected_context);
+    response.metrics.generation_ms = stage_timer.elapsed_time_ms();
+    response.metrics.total_ms = total_timer.elapsed_time_ms();
+
+    POWERSERVE_LOG_INFO("compute carrier baseline end");
+    log_rag_stage_metrics(response);
+    return response;
+}
+
 inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const RagRequest &request) {
     using namespace powerserve;
 
@@ -938,6 +1360,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     response.mode_requested = request.mode;
     response.mode_used = "hetero_parallel";
     response.query_used = request.query;
+    response.generation_candidate_repeats = request.generation_candidate_repeats;
     const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
     response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
     response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
@@ -951,7 +1374,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     DocBranchOutput doc_branch;
     QueryBranchOutput query_branch;
     const size_t retrieval_branch_count = request.enable_query_expansion ? 3 : 1;
-    const size_t generation_task_count = request.enable_query_expansion ? 4 : 1;
+    const size_t generation_task_count = request.enable_query_expansion ? (1 + 3 * request.generation_candidate_repeats) : 1;
 
     std::vector<std::vector<float>> query_embeddings(retrieval_branch_count);
     std::vector<std::vector<size_t>> per_query_top_indices(retrieval_branch_count);
@@ -1181,7 +1604,8 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                 request.query,
                 query_branch.sub_queries,
                 selected_context,
-                request.generation_decode_steps
+                request.generation_decode_steps,
+                request.generation_candidate_repeats
             );
             if (generation_tasks.size() != generation_task_count) {
                 throw std::runtime_error("generation task count mismatch while building big dag");

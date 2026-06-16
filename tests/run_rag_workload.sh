@@ -37,6 +37,7 @@ esac
 #   ./tests/run_rag_workload.sh 4K npu_cpu 8gen5
 #   ./tests/run_rag_workload.sh 8K pure_cpu_sequential 8gen4
 #   ./tests/run_rag_workload.sh 6K pure_npu_sequential 8gen5
+#   ./tests/run_rag_workload.sh 4K npu_cpu_baseline 8gen4
 
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKLOADS_JSON="$LOCAL_DIR/workloads/workloads.json"
@@ -45,6 +46,8 @@ LOCAL_TMP_DIR="$LOCAL_DIR/.tmp"
 
 WORKLOAD="${1:-}"
 PROFILE="${2:-npu_cpu}"
+TOP_N_OVERRIDE="${RAG_TOP_N:-}"
+CANDIDATE_REPEATS_OVERRIDE="${RAG_CANDIDATE_REPEATS:-}"
 
 # Validate workload
 if [[ -z "$WORKLOAD" ]]; then
@@ -110,9 +113,14 @@ case "$PROFILE" in
     GEN_PREFILL_BACKEND="npu"
     GEN_DECODE_BACKEND="cpu"
     ;;
+  npu_cpu_baseline|hetero_npu_cpu_baseline|carrier_baseline)
+    MODE="carrier_baseline"
+    GEN_PREFILL_BACKEND="npu"
+    GEN_DECODE_BACKEND="cpu"
+    ;;
   *)
     echo "unknown profile: $PROFILE" >&2
-    echo "try: pure_cpu_sequential | pure_npu_sequential | npu_cpu" >&2
+    echo "try: pure_cpu_sequential | pure_npu_sequential | npu_cpu | npu_cpu_baseline" >&2
     exit 2
     ;;
 esac
@@ -142,6 +150,8 @@ LOCAL_DOC_SOURCE_FOR_PY="$LOCAL_DOC_SOURCE" \
 RAG_MODE="$MODE" \
 RAG_PREFILL_BACKEND="$GEN_PREFILL_BACKEND" \
 RAG_DECODE_BACKEND="$GEN_DECODE_BACKEND" \
+RAG_TOP_N="$TOP_N_OVERRIDE" \
+RAG_CANDIDATE_REPEATS="$CANDIDATE_REPEATS_OVERRIDE" \
 python3 - <<'PY'
 import json
 import os
@@ -153,21 +163,38 @@ doc_source = Path(os.environ['LOCAL_DOC_SOURCE_FOR_PY'])
 rag_mode = os.environ['RAG_MODE']
 rag_prefill_backend = os.environ['RAG_PREFILL_BACKEND']
 rag_decode_backend = os.environ['RAG_DECODE_BACKEND']
+rag_top_n = os.environ.get('RAG_TOP_N', '').strip()
+rag_candidate_repeats = os.environ.get('RAG_CANDIDATE_REPEATS', '').strip()
 
 payload = json.loads(src_payload.read_text(encoding='utf-8'))
 payload['doc'] = doc_source.read_text(encoding='utf-8')
 payload['mode'] = rag_mode
 payload['generation_prefill_backend'] = rag_prefill_backend
 payload['generation_decode_backend'] = rag_decode_backend
+if rag_top_n:
+    top_n = int(rag_top_n)
+    if top_n <= 0:
+        raise ValueError('RAG_TOP_N must be > 0')
+    payload['top_n'] = top_n
+if rag_candidate_repeats:
+    candidate_repeats = int(rag_candidate_repeats)
+    if candidate_repeats <= 0:
+        raise ValueError('RAG_CANDIDATE_REPEATS must be > 0')
+    payload['generation_candidate_repeats'] = candidate_repeats
 # Ensure decode steps and max_tokens are consistent
-payload['generation_decode_steps'] = 64
-payload['max_tokens'] = 64
+payload['generation_decode_steps'] = 256
+payload['max_tokens'] = 256
 
 local_payload.write_text(
     json.dumps(payload, ensure_ascii=False),
     encoding='utf-8',
 )
-print(f'payload ready: {local_payload}')
+print(
+    f"payload ready: {local_payload} "
+    f"(top_k={payload.get('top_k')}, top_n={payload.get('top_n')}, "
+    f"decode={payload.get('generation_decode_steps')}, "
+    f"candidate_repeats={payload.get('generation_candidate_repeats', 1)})"
+)
 PY
 
 echo "[4/4] run request"
