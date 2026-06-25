@@ -43,6 +43,14 @@ void QNNBackend::unload_model(const std::shared_ptr<powerserve::ModelConfig> &mo
     m_models.erase(model_id);
 }
 
+auto QNNBackend::get_kv_interface(const std::string &model_id) const -> KVCacheInterface * {
+    auto iter = m_models.find(model_id);
+    if (iter == m_models.end() || !iter->second) {
+        return nullptr;
+    }
+    return iter->second->kv_cache.get();
+}
+
 void QNNBackend::forward(
     const std::string &model_id,
     const Tensor *dst,

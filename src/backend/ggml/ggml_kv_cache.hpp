@@ -98,9 +98,9 @@ public:
 
         ALWAYS_INLINE auto value_entry(KVPosition cache_pos) const -> KVView {
             auto &chk       = chunk.value_buffer[cache_pos.layer_id];
-            auto buffer     = chk.data() + cache_pos.index * parent.m_kv_dim + cache_pos.head_id * parent.m_head_size;
+            auto buffer     = chk.data() + cache_pos.head_id * parent.m_head_size * parent.m_n_ctx + cache_pos.index;
             size_t n_elem   = parent.m_head_size;
-            size_t n_stride = sizeof(float); // TODO: transpose will change stride
+            size_t n_stride = sizeof(float) * parent.m_n_ctx;
 
             return {
                 .n_elements   = n_elem,
@@ -157,6 +157,16 @@ public:
     auto get_cache(size_t L) -> std::pair<Tensor &, Tensor &> {
         return {chunk.key_tensors[L], chunk.value_tensors[L]};
     }
+
+public:
+    struct Snapshot {
+        size_t position = 0;
+        KVBuffer key_buffer;
+        KVBuffer value_buffer;
+    };
+
+    auto save_snapshot() const -> std::unique_ptr<Snapshot>;
+    void restore_snapshot(const Snapshot &snapshot);
 
 private:
     void prepare_model_chunk();
