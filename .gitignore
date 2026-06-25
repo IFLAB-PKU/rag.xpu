@@ -20,6 +20,7 @@ compare*.py
 
 *.npy
 *.txt
+!CMakeLists.txt
 *.csv
 
 docs/pd_split_baseline_contract.md
@@ -30,3 +31,4 @@ tests/pd-bench-*.csv
 tests/server-metrics*.md
 tests/server-overlap.log
 tests/results/
+tests/rag_payload_*.json

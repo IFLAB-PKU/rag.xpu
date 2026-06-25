@@ -166,8 +166,12 @@ auto Qwen3Model::forward(
         auto *qnn_model_kv = qnn_backend->get_kv_interface(m_config->model_id);
         POWERSERVE_ASSERT(qnn_model_kv != nullptr, "model '{}' not found in qnn backend", m_config->model_id);
 
+        auto *execution_route = current_model_execution_route();
+        auto *effective_kv_cache = execution_route != nullptr && execution_route->kv_cache != nullptr
+            ? execution_route->kv_cache
+            : kv_cache;
         const bool decode_step    = lm_head && batch_size == 1;
-        const bool keep_qnn_route = (kv_cache != nullptr && kv_cache == qnn_model_kv);
+        const bool keep_qnn_route = (effective_kv_cache != nullptr && effective_kv_cache == qnn_model_kv);
         use_qnn_backend           = !decode_step || keep_qnn_route;
     }
     if (use_qnn_backend) {
@@ -196,7 +200,10 @@ auto Qwen3Model::forward(
     {
         POWERSERVE_ASSERT(!lazy_load, "Qwen3 CPU decode requires full GGUF weights (lazy_load=false)");
         powerserve::ggml::GGMLKV *active_ggml_kv = m_platform->ggml_backends[m_config->model_id]->m_kv.get();
-        if (ggml_kv_override != nullptr) {
+        auto *execution_route = current_model_execution_route();
+        if (execution_route != nullptr && execution_route->ggml_kv_override != nullptr) {
+            active_ggml_kv = static_cast<powerserve::ggml::GGMLKV *>(execution_route->ggml_kv_override);
+        } else if (ggml_kv_override != nullptr) {
             active_ggml_kv = static_cast<powerserve::ggml::GGMLKV *>(ggml_kv_override);
         }
         active_ggml_kv->reset_batch_size(batch_size);
@@ -229,7 +236,10 @@ auto Qwen3Model::forward(
 #endif
     {
         powerserve::ggml::GGMLKV *active_ggml_kv = m_platform->ggml_backends[m_config->model_id]->m_kv.get();
-        if (ggml_kv_override != nullptr) {
+        auto *execution_route = current_model_execution_route();
+        if (execution_route != nullptr && execution_route->ggml_kv_override != nullptr) {
+            active_ggml_kv = static_cast<powerserve::ggml::GGMLKV *>(execution_route->ggml_kv_override);
+        } else if (ggml_kv_override != nullptr) {
             active_ggml_kv = static_cast<powerserve::ggml::GGMLKV *>(ggml_kv_override);
         }
         active_ggml_kv->advance(batch_size);
