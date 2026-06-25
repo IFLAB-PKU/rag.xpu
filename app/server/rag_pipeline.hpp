@@ -1895,18 +1895,14 @@ inline RagResponse run_rag_hetero_parallel(
 
                 try {
                     const auto &tokenizer = *context.m_tokenizer_ptr;
-                    const bool use_private_kv_unlocked_decode = decode_route.backend == BackendKind::CPU;
-                    std::unique_lock<std::mutex> model_exec_lock;
-                    if (!use_private_kv_unlocked_decode) {
-                        model_exec_lock = lock_model_execution(context);
-                    }
+                    auto model_exec_lock = lock_model_execution(context);
                     POWERSERVE_LOG_DEBUG(
                         "scheduler2 dag decode start: request_id={}, backend={}",
                         input.request_id,
                         BackendRouter::backend_name(decode_route.backend)
                     );
 
-                    if (input.m_generation_route_enabled && !use_private_kv_unlocked_decode) {
+                    if (input.m_generation_route_enabled) {
                         if (!set_generation_backend_route(context, BackendRouter::backend_name(decode_route.backend))) {
                             POWERSERVE_LOG_WARN(
                                 "scheduler2 dag decode backend route fallback to cpu, request_id={}, target={}",
@@ -1966,7 +1962,7 @@ inline RagResponse run_rag_hetero_parallel(
                         };
                         powerserve::ScopedModelExecutionRoute route_guard(decode_route_override);
                         POWERSERVE_LOG_INFO(
-                            "scheduler2 dag decode private-kv unlocked path: request_id={}, backend=cpu",
+                            "scheduler2 dag decode private-kv path: request_id={}, backend=cpu",
                             input.request_id
                         );
 

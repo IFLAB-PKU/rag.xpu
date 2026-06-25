@@ -92,6 +92,11 @@ private:
     std::thread worker_npu_;
     bool shutdown_ = false;
     size_t active_count_ = 0;
+    // Number of active DAGs that requested critical-score scheduling.
+    // While > 0, tasks are sorted by critical_score and generation tasks are
+    // pinned to their target backend. Otherwise keep the original FIFO/steal
+    // behavior for maximum throughput.
+    size_t priority_mode_ref_count_ = 0;
 
     void enqueue_task(Scheduler2Task task);
     void worker_loop(BackendKind worker_backend);

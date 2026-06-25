@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Benchmark all workloads (4K/6K/8K) with a given profile.
+# Benchmark all workloads (4K/6K/8K/10K) with a given profile.
 # Usage:
 #   ./tests/run_rag_benchmark.sh [profile]
 #
@@ -14,7 +14,7 @@ set -euo pipefail
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILE="${1:-npu_cpu}"
 
-WORKLOADS=("4K" "6K" "8K")
+WORKLOADS=("4K" "6K" "8K" "10K")
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULT_DIR="$LOCAL_DIR/results"
 RESULT_FILE="$RESULT_DIR/benchmark_${PROFILE}_${TIMESTAMP}.json"

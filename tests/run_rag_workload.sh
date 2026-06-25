@@ -29,7 +29,7 @@ case "$DEVICE_PROFILE" in
     ;;
 esac
 
-# Run a single workload (4K/6K/8K) with specified profile.
+# Run a single workload (4K/6K/8K/10K) with specified profile.
 # Usage:
 #   ./tests/run_rag_workload.sh <workload> [profile] [8gen4|8gen5]
 #
@@ -55,7 +55,7 @@ GENERATION_MODEL_OVERRIDE="${RAG_GENERATION_MODEL:-qwen3-4b}"
 # Validate workload
 if [[ -z "$WORKLOAD" ]]; then
 echo "Usage: $0 <workload> [profile] [8gen4|8gen5]" >&2
-    echo "  workload: 4K | 6K | 8K" >&2
+    echo "  workload: 4K | 6K | 8K | 10K" >&2
     exit 1
 fi
 
@@ -74,7 +74,7 @@ print(entry.get('payload_file', ''), entry.get('doc_file', ''))
 
 if [[ -z "$PAYLOAD_FILE" || -z "$DOC_FILE" ]]; then
     echo "unknown workload: $WORKLOAD" >&2
-    echo "available: 4K | 6K | 8K" >&2
+    echo "available: 4K | 6K | 8K | 10K" >&2
     exit 2
 fi
 

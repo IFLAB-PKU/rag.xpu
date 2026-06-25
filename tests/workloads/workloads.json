@@ -2,16 +2,21 @@
   "4K": {
     "payload_file": "tests/rag_payload_once.json",
     "doc_file": "tests/workloads/doc_4K.txt",
-    "description": "Lightweight retrieval: short document, single fact lookup"
+    "description": "Lightweight retrieval: short excerpt from OpenAI case study, single-section fact lookup"
   },
   "6K": {
     "payload_file": "tests/rag_payload_once.json",
     "doc_file": "tests/workloads/doc_6K.txt",
-    "description": "Moderate retrieval: requires comparing two distinct passages"
+    "description": "Moderate retrieval: medium excerpt from OpenAI case study, comparing early and later priorities"
   },
   "8K": {
     "payload_file": "tests/rag_payload_once.json",
     "doc_file": "tests/workloads/doc_8K.txt",
-    "description": "Heavy retrieval: must locate specific info among stellar evolution and galaxy structure content"
+    "description": "Heavy retrieval: full OpenAI case study (~7.8K), must locate trade-offs across capability, safety, and deployment"
+  },
+  "10K": {
+    "payload_file": "tests/rag_payload_once.json",
+    "doc_file": "tests/workloads/doc_10K.txt",
+    "description": "Extended retrieval: full OpenAI case study plus forward-looking trade-offs (~10K), tests longer-context retrieval and generation"
   }
 }

@@ -113,29 +113,29 @@ Scheduler2::~Scheduler2() {
 }
 
 void Scheduler2::enqueue_task(Scheduler2Task task) {
+    bool priority_mode = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (should_enqueue_cpu(task.backend)) {
-            auto insert_pos = cpu_queue_.end();
-            for (auto iter = cpu_queue_.begin(); iter != cpu_queue_.end(); ++iter) {
+        priority_mode = priority_mode_ref_count_ > 0;
+        auto &queue = should_enqueue_cpu(task.backend) ? cpu_queue_ : npu_queue_;
+        if (priority_mode) {
+            auto insert_pos = queue.end();
+            for (auto iter = queue.begin(); iter != queue.end(); ++iter) {
                 if (task.critical_score > iter->critical_score) {
                     insert_pos = iter;
                     break;
                 }
             }
-            cpu_queue_.insert(insert_pos, std::move(task));
+            queue.insert(insert_pos, std::move(task));
         } else {
-            auto insert_pos = npu_queue_.end();
-            for (auto iter = npu_queue_.begin(); iter != npu_queue_.end(); ++iter) {
-                if (task.critical_score > iter->critical_score) {
-                    insert_pos = iter;
-                    break;
-                }
-            }
-            npu_queue_.insert(insert_pos, std::move(task));
+            queue.push_back(std::move(task));
         }
     }
-    cv_.notify_all();
+    if (priority_mode) {
+        cv_.notify_all();
+    } else {
+        cv_.notify_one();
+    }
 }
 
 std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes, bool enable_critical_score) {
@@ -243,6 +243,14 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes, b
         return graph_future;
     }
 
+    if (enable_critical_score) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++priority_mode_ref_count_;
+        POWERSERVE_LOG_DEBUG(
+            "Scheduler2 priority mode enabled: ref_count={}", priority_mode_ref_count_
+        );
+    }
+
     auto completed = std::make_shared<std::atomic_size_t>(0);
     auto failed = std::make_shared<std::atomic_bool>(false);
     auto finished = std::make_shared<std::atomic_bool>(false);
@@ -308,7 +316,8 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes, b
             .type = node.type,
             .request_id = node.request_id,
             .backend = node.backend,
-            .fn = [node_id,
+            .fn = [this,
+                   node_id,
                    node_map,
                    indegree,
                    children,
@@ -340,6 +349,15 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes, b
                     if (!finished->exchange(true)) {
                         if (enable_critical_score) {
                             (*log_enqueue_order)("failed");
+                            {
+                                std::lock_guard<std::mutex> lock(this->mutex_);
+                                POWERSERVE_ASSERT(this->priority_mode_ref_count_ > 0);
+                                --this->priority_mode_ref_count_;
+                                POWERSERVE_LOG_DEBUG(
+                                    "Scheduler2 priority mode disabled on failure: ref_count={}",
+                                    this->priority_mode_ref_count_
+                                );
+                            }
                         }
                         std::exception_ptr err;
                         {
@@ -361,6 +379,15 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes, b
                     if (!finished->exchange(true)) {
                         if (enable_critical_score) {
                             (*log_enqueue_order)("completed");
+                            {
+                                std::lock_guard<std::mutex> lock(this->mutex_);
+                                POWERSERVE_ASSERT(this->priority_mode_ref_count_ > 0);
+                                --this->priority_mode_ref_count_;
+                                POWERSERVE_LOG_DEBUG(
+                                    "Scheduler2 priority mode disabled on completion: ref_count={}",
+                                    this->priority_mode_ref_count_
+                                );
+                            }
                         }
                         graph_promise->set_value();
                     }
@@ -458,12 +485,16 @@ void Scheduler2::worker_loop(BackendKind worker_backend) {
                 if (shutdown_) {
                     return true;
                 }
+                const bool priority_mode = priority_mode_ref_count_ > 0;
+                const auto can_take = [priority_mode, worker_backend](const Scheduler2Task &t) -> bool {
+                    return !priority_mode || can_steal_task(worker_backend, t);
+                };
                 if (worker_backend == BackendKind::CPU) {
                     return !cpu_queue_.empty() ||
-                        (!npu_queue_.empty() && can_steal_task(worker_backend, npu_queue_.front()));
+                        (!npu_queue_.empty() && can_take(npu_queue_.front()));
                 }
                 return !npu_queue_.empty() ||
-                    (!cpu_queue_.empty() && can_steal_task(worker_backend, cpu_queue_.front()));
+                    (!cpu_queue_.empty() && can_take(cpu_queue_.front()));
             });
 
             if (shutdown_ && cpu_queue_.empty() && npu_queue_.empty()) {
@@ -480,14 +511,18 @@ void Scheduler2::worker_loop(BackendKind worker_backend) {
             };
 
             bool popped = false;
+            const bool priority_mode = priority_mode_ref_count_ > 0;
+            const auto can_take = [priority_mode, worker_backend](const Scheduler2Task &t) -> bool {
+                return !priority_mode || can_steal_task(worker_backend, t);
+            };
             if (worker_backend == BackendKind::CPU) {
                 popped = pop_from_queue(cpu_queue_, task);
-                if (!popped && !npu_queue_.empty() && can_steal_task(worker_backend, npu_queue_.front())) {
+                if (!popped && !npu_queue_.empty() && can_take(npu_queue_.front())) {
                     popped = pop_from_queue(npu_queue_, task); // steal
                 }
             } else {
                 popped = pop_from_queue(npu_queue_, task);
-                if (!popped && !cpu_queue_.empty() && can_steal_task(worker_backend, cpu_queue_.front())) {
+                if (!popped && !cpu_queue_.empty() && can_take(cpu_queue_.front())) {
                     popped = pop_from_queue(cpu_queue_, task); // steal
                 }
             }
