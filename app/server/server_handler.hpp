@@ -28,6 +28,9 @@
 #include "model/model_loader.hpp"
 #include "model/module/norm_attention.hpp"
 #include "sampler/sampler_chain.hpp"
+#include "scheduler2/backend_router.hpp"
+#include "scheduler2/kv_cache_manager.hpp"
+#include "scheduler2/scheduler2.hpp"
 #include "speculative/spec_model.hpp"
 
 #include <algorithm>
@@ -309,6 +312,10 @@ private:
     std::map<ServerSessionId, ServerSession> m_session_map;
 
 public:
+    std::unique_ptr<powerserve::Scheduler2> scheduler2;
+    std::unique_ptr<powerserve::KvCacheManager> kv_cache_manager;
+    powerserve::BackendRouter backend_router;
+
     ServerContext(powerserve::Path work_folder, powerserve::Path lib_folder) :
         m_work_folder(std::move(work_folder)),
         m_lib_folder(std::move(lib_folder)),
@@ -323,6 +330,8 @@ public:
 #if defined(POWERSERVE_WITH_QNN)
         m_platform_ptr->init_qnn_backend(m_lib_folder);
 #endif // POWERSERVE_WITH_QNN
+        scheduler2 = std::make_unique<powerserve::Scheduler2>();
+        kv_cache_manager = std::make_unique<powerserve::KvCacheManager>();
     }
 
     ~ServerContext() = default;
@@ -1257,12 +1266,138 @@ private:
 };
 
 inline GenerationDecodeCandidate blocking_inference_segmented_prefill_decode_task(
+    ServerContext &server_context,
     const ModelContext &context,
     const ModelInput &input,
     const GenerationDecodeTask &decode_task
 ) {
-    static SequentialSegmentPrefillQueueDemo queue_demo;
-    return queue_demo.run_decode_task(context, input, decode_task);
+    using namespace powerserve;
+
+    POWERSERVE_ASSERT(server_context.scheduler2 != nullptr);
+    POWERSERVE_ASSERT(server_context.kv_cache_manager != nullptr);
+    const bool npu_available =
+#if defined(POWERSERVE_WITH_QNN)
+        true;
+#else
+        false;
+#endif
+
+    const auto prefill_route = server_context.backend_router.route_for_generation_prefill(
+        input.m_generation_prefill_backend_target,
+        npu_available
+    );
+    const auto decode_route = server_context.backend_router.route_for_generation_decode(
+        input.m_generation_decode_backend_target,
+        npu_available
+    );
+
+    auto prefill_future = server_context.scheduler2->submit(
+        Scheduler2TaskType::GENERATION_PREFILL,
+        input.request_id,
+        prefill_route.backend,
+        [&]() {
+            const auto &tokenizer = *context.m_tokenizer_ptr;
+            auto model_exec_lock = lock_model_execution(context);
+
+            auto sampler_config = context.m_config.hyper_params.sampler_config;
+            sampler_config.temperature = input.m_temperature;
+            sampler_config.penalty_freq = input.m_frequency_penalty;
+            sampler_config.penalty_present = input.m_presence_penalty;
+            sampler_config.penalty_repeat = input.m_repeat_penalty;
+            sampler_config.top_p = input.m_top_p;
+            powerserve::SamplerChain sampler{sampler_config, tokenizer};
+
+            if (input.m_generation_route_enabled) {
+                if (!set_generation_backend_route(context, BackendRouter::backend_name(prefill_route.backend))) {
+                    POWERSERVE_LOG_WARN(
+                        "scheduler2 prefill backend route fallback to cpu, request_id={}, target={}",
+                        input.request_id,
+                        input.m_generation_prefill_backend_target
+                    );
+                    (void)set_generation_backend_route(context, "cpu");
+                }
+            }
+
+            std::string model_id = context.m_model_ptr->m_config->model_id;
+            const size_t kv_position_begin = context.m_model_ptr->m_platform->get_kv_position(model_id);
+            BlockingPrefillResult prefill_result = run_blocking_prefill_segmented(
+                context,
+                input,
+                decode_task.input_segments,
+                sampler
+            );
+            PrefillArtifact artifact = build_prefill_artifact(context, input, prefill_result, kv_position_begin);
+            server_context.kv_cache_manager->put({
+                .request_id = artifact.request_id,
+                .model_id = artifact.model_id,
+                .producer_backend = BackendRouter::backend_name(prefill_route.backend),
+                .kv_begin = artifact.kv_position_begin,
+                .kv_end = artifact.kv_position_end,
+                .prefill_tokens_total = artifact.prefill_tokens_total,
+            });
+            return prefill_result;
+        }
+    );
+
+    auto decode_future = server_context.scheduler2->submit(
+        Scheduler2TaskType::GENERATION_DECODE,
+        input.request_id,
+        decode_route.backend,
+        [&]() {
+            auto prefill_result = prefill_future.get();
+            const auto cache_record = server_context.kv_cache_manager->get(input.request_id);
+            if (!cache_record.has_value()) {
+                throw std::runtime_error("scheduler2 missing kv cache record for decode");
+            }
+            if (cache_record->producer_backend == "npu" &&
+                decode_route.backend == BackendKind::CPU) {
+                const bool bridged = server_context.kv_cache_manager->bridge_to_cpu(input.request_id);
+                if (bridged) {
+                    POWERSERVE_LOG_INFO(
+                        "scheduler2 kv bridge hook: request_id={}, prefill_backend=npu, decode_backend=cpu",
+                        input.request_id
+                    );
+                } else {
+                    POWERSERVE_LOG_WARN(
+                        "scheduler2 kv bridge hook failed: request_id={}",
+                        input.request_id
+                    );
+                }
+            }
+
+            try {
+                const auto &tokenizer = *context.m_tokenizer_ptr;
+                auto model_exec_lock = lock_model_execution(context);
+
+                if (input.m_generation_route_enabled) {
+                    if (!set_generation_backend_route(context, BackendRouter::backend_name(decode_route.backend))) {
+                        POWERSERVE_LOG_WARN(
+                            "scheduler2 decode backend route fallback to cpu, request_id={}, target={}",
+                            input.request_id,
+                            input.m_generation_decode_backend_target
+                        );
+                        (void)set_generation_backend_route(context, "cpu");
+                    }
+                }
+
+                LocalDecodeExecutor decode_executor;
+                auto candidate = run_blocking_decode_task_from_artifact(
+                    decode_executor,
+                    input,
+                    tokenizer,
+                    prefill_result,
+                    decode_task
+                );
+                server_context.kv_cache_manager->release(input.request_id);
+                return candidate;
+            } catch (...) {
+                server_context.kv_cache_manager->release(input.request_id);
+                throw;
+            }
+        }
+    );
+
+    return decode_future.get();
 }
 
 struct PDOrchestratorTask {
@@ -1398,6 +1533,10 @@ public:
             .input_prompt = input_prompt,
             .enqueued_at  = std::chrono::steady_clock::now(),
         };
+        // Plain /completion requests are not segmented RAG tasks; decode fully
+        // instead of using the GenerationDecodeTask default of 1 step.
+        task.decode_task.max_decode_steps = 0;
+
         std::future<ModelOutput> result_future = task.result_promise.get_future();
 
         {

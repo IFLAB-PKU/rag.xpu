@@ -34,18 +34,22 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
     rag_request.top_n = request.value("top_n", size_t{5});
     rag_request.max_tokens = request.value("max_tokens", size_t{128});
     rag_request.generation_decode_steps = request.value("generation_decode_steps", size_t{64});
+    rag_request.generation_subquery_decode_steps = request.value("generation_subquery_decode_steps", size_t{64});
+    rag_request.generation_candidate_repeats = request.value("generation_candidate_repeats", size_t{1});
     rag_request.generation_prefill_backend = request.value("generation_prefill_backend", std::string{"auto"});
     rag_request.generation_decode_backend = request.value("generation_decode_backend", std::string{"auto"});
     rag_request.temperature = request.value("temperature", 0.2F);
-    rag_request.enable_pd_orchestrator = request.value("enable_pd_orchestrator", false);
 
     rag_request.generation_model = request.value("generation_model", request.value("model", std::string{}));
     rag_request.embedding_model = request.value("embedding_model", std::string{});
     rag_request.rerank_model = request.value("rerank_model", std::string{});
     rag_request.expansion_model = request.value("expansion_model", std::string{});
 
-    if (rag_request.mode != "sequential" && rag_request.mode != "hetero_parallel") {
-        throw std::invalid_argument("'mode' must be one of: sequential, hetero_parallel");
+    if (rag_request.mode != "sequential" &&
+        rag_request.mode != "hetero_parallel" &&
+        rag_request.mode != "carrier_baseline" &&
+        rag_request.mode != "npu_cpu_cs") {
+        throw std::invalid_argument("'mode' must be one of: sequential, hetero_parallel, carrier_baseline, npu_cpu_cs");
     }
     if (rag_request.top_n == 0 || rag_request.top_k == 0) {
         throw std::invalid_argument("'top_k' and 'top_n' must be > 0");
@@ -55,6 +59,12 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
     }
     if (rag_request.generation_decode_steps == 0) {
         throw std::invalid_argument("'generation_decode_steps' must be > 0");
+    }
+    if (rag_request.generation_subquery_decode_steps == 0) {
+        throw std::invalid_argument("'generation_subquery_decode_steps' must be > 0");
+    }
+    if (rag_request.generation_candidate_repeats == 0) {
+        throw std::invalid_argument("'generation_candidate_repeats' must be > 0");
     }
 
     const std::string prefill_backend = normalize_backend_target(rag_request.generation_prefill_backend);
@@ -69,7 +79,6 @@ inline RagRequest parse_rag_request(const nlohmann::json &request) {
 inline nlohmann::json dump_rag_response(const RagResponse &response) {
     const nlohmann::json stage_timeline = nlohmann::json::array({
         nlohmann::json{{"stage", "indexing"}, {"ms", response.metrics.indexing_ms}},
-        nlohmann::json{{"stage", "doc_embedding"}, {"ms", response.metrics.doc_embedding_ms}},
         nlohmann::json{{"stage", "query_expand"}, {"ms", response.metrics.query_expand_ms}},
         nlohmann::json{{"stage", "query_embedding"}, {"ms", response.metrics.query_embedding_ms}},
         nlohmann::json{{"stage", "searching"}, {"ms", response.metrics.searching_ms}},
@@ -103,7 +112,9 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
                     {"generation_segmented_prefill_used", response.generation_segmented_prefill_used},
                     {"generation_prefill_queue_wait_ms", response.generation_prefill_queue_wait_ms},
                     {"generation_decode_steps", response.generation_decode_steps},
+                    {"generation_subquery_decode_steps", response.generation_subquery_decode_steps},
                     {"decode_task_count", response.decode_task_count},
+                    {"generation_candidate_repeats", response.generation_candidate_repeats},
                     {"selected_answer_source", response.selected_answer_source},
                     {"candidate_count", response.candidate_count},
                     {"merge_policy_version", response.merge_policy_version},
@@ -111,11 +122,19 @@ inline nlohmann::json dump_rag_response(const RagResponse &response) {
                     {"generation_decode_backend_target", response.generation_decode_backend_target},
                     {"generation_kv_bridge_available", response.generation_kv_bridge_available},
                     {"generation_route_note", response.generation_route_note},
+                    {"generation_sub_metrics",
+                     {{"prefill_ms", response.generation_sub_metrics.prefill_ms},
+                      {"decode_ms", response.generation_sub_metrics.decode_ms},
+                      {"prefill_sum_ms", response.generation_sub_metrics.prefill_sum_ms},
+                      {"decode_sum_ms", response.generation_sub_metrics.decode_sum_ms},
+                      {"bridge_ms", response.generation_sub_metrics.bridge_ms},
+                      {"kv_snapshot_ms", response.generation_sub_metrics.kv_snapshot_ms},
+                      {"kv_restore_ms", response.generation_sub_metrics.kv_restore_ms},
+                      {"kv_snapshot_bytes", response.generation_sub_metrics.kv_snapshot_bytes}}},
                     {"decode_task_summaries", decode_task_summaries_json}}},
         {"stage_metrics_ms",
          {{"indexing", response.metrics.indexing_ms},
           {"query_expand", response.metrics.query_expand_ms},
-                    {"doc_embedding", response.metrics.doc_embedding_ms},
                     {"query_embedding", response.metrics.query_embedding_ms},
           {"embedding", response.metrics.embedding_ms},
           {"searching", response.metrics.searching_ms},
@@ -145,7 +164,11 @@ inline void handler_rag(ServerContext &server_context, const T_Request &request,
     try {
         const RagResponse rag_response = rag_request.mode == "hetero_parallel"
             ? run_rag_hetero_parallel(server_context, rag_request)
-            : run_rag_sequential(server_context, rag_request);
+            : (rag_request.mode == "npu_cpu_cs"
+                ? run_rag_hetero_parallel(server_context, rag_request, true)
+                : (rag_request.mode == "carrier_baseline"
+                    ? run_rag_compute_carrier_baseline(server_context, rag_request)
+                    : run_rag_sequential(server_context, rag_request)));
         response_normal(dump_rag_response(rag_response), response);
         POWERSERVE_LOG_INFO("after rag: {}", powerserve::perf_get_mem_result());
     } catch (const std::invalid_argument &err) {

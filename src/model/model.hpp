@@ -24,6 +24,38 @@
 
 namespace powerserve {
 
+struct ModelExecutionRoute {
+    KVCacheInterface *kv_cache = nullptr;
+    void *ggml_kv_override = nullptr;
+};
+
+inline thread_local ModelExecutionRoute *tls_model_execution_route = nullptr;
+
+class ScopedModelExecutionRoute {
+public:
+    explicit ScopedModelExecutionRoute(ModelExecutionRoute *route) :
+        previous_route_(tls_model_execution_route) {
+        tls_model_execution_route = route;
+    }
+
+    explicit ScopedModelExecutionRoute(ModelExecutionRoute &route) :
+        ScopedModelExecutionRoute(&route) {}
+
+    ~ScopedModelExecutionRoute() {
+        tls_model_execution_route = previous_route_;
+    }
+
+    ScopedModelExecutionRoute(const ScopedModelExecutionRoute &) = delete;
+    ScopedModelExecutionRoute &operator=(const ScopedModelExecutionRoute &) = delete;
+
+private:
+    ModelExecutionRoute *previous_route_ = nullptr;
+};
+
+inline ModelExecutionRoute *current_model_execution_route() {
+    return tls_model_execution_route;
+}
+
 struct LogitsVector {
     BufferPtr buffer;
     std::vector<std::span<const float>> logits_vector;
@@ -236,7 +268,10 @@ public:
         if (n_rest > 0 && m_tokens.size() >= 1) {
             if (m_tokens.size() == 1) {
                 size_t current_pos = 0;
-                if (m_model.kv_cache != nullptr) {
+                auto *execution_route = current_model_execution_route();
+                if (execution_route != nullptr && execution_route->kv_cache != nullptr) {
+                    current_pos = execution_route->kv_cache->position;
+                } else if (m_model.kv_cache != nullptr) {
                     current_pos = m_model.kv_cache->position;
                 } else {
                     auto &platform = m_model.m_platform;
