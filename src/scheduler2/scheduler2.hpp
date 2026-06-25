@@ -39,6 +39,7 @@ struct Scheduler2Task {
     Scheduler2TaskType type = Scheduler2TaskType::UNKNOWN;
     size_t request_id = 0;
     BackendKind backend = BackendKind::CPU;
+    double critical_score = 0.0;
     std::function<void()> fn;
     std::chrono::steady_clock::time_point enqueued_at = std::chrono::steady_clock::now();
 };
@@ -49,6 +50,7 @@ struct Scheduler2DagNode {
     size_t request_id = 0;
     BackendKind backend = BackendKind::CPU;
     std::vector<size_t> dependencies;
+    double critical_score = 0.0;
     std::function<void()> fn;
     std::string debug_name;
 };
@@ -75,7 +77,7 @@ public:
         return result;
     }
 
-    std::future<void> submit_dag(std::vector<Scheduler2DagNode> nodes);
+    std::future<void> submit_dag(std::vector<Scheduler2DagNode> nodes, bool enable_critical_score = false);
     void drain();
     size_t pending_count() const;
     size_t active_count() const;

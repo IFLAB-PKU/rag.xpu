@@ -48,6 +48,7 @@ struct RagRequest {
     size_t top_n = 5;
     size_t max_tokens = 128;
     size_t generation_decode_steps = 64;
+    size_t generation_subquery_decode_steps = 64;
     size_t generation_candidate_repeats = 1;
     std::string generation_prefill_backend = "auto";
     std::string generation_decode_backend = "auto";
@@ -93,6 +94,7 @@ struct RagResponse {
     bool generation_segmented_prefill_used = false;
     size_t generation_prefill_queue_wait_ms = 0;
     size_t generation_decode_steps = 0;
+    size_t generation_subquery_decode_steps = 0;
     size_t decode_task_count = 0;
     size_t generation_candidate_repeats = 1;
     std::string selected_answer_source;
@@ -513,6 +515,7 @@ inline std::vector<GenerationDecodeTask> build_generation_decode_tasks(
     const std::vector<std::string> &sub_queries,
     const std::vector<std::string> &context_chunks,
     size_t max_decode_steps,
+    size_t subquery_max_decode_steps,
     size_t candidate_repeats = 1
 ) {
     std::vector<GenerationDecodeTask> tasks;
@@ -529,7 +532,7 @@ inline std::vector<GenerationDecodeTask> build_generation_decode_tasks(
         for (const auto &sub_query : sub_queries) {
             GenerationDecodeTask task;
             task.query_type = "subquery";
-            task.max_decode_steps = max_decode_steps;
+            task.max_decode_steps = subquery_max_decode_steps;
             task.input_segments = build_generation_segments(sub_query, {}, context_chunks);
             tasks.push_back(std::move(task));
         }
@@ -681,6 +684,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
     response.mode_used = request.mode == "hetero_parallel" ? "sequential" : request.mode;
     response.query_used = request.query;
     response.generation_candidate_repeats = request.generation_candidate_repeats;
+    response.generation_subquery_decode_steps = request.generation_subquery_decode_steps;
     const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
     response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
     response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
@@ -814,6 +818,7 @@ inline RagResponse run_rag_sequential(ServerContext &server_context, const RagRe
         response.sub_queries,
         selected_context,
         request.generation_decode_steps,
+        request.generation_subquery_decode_steps,
         request.generation_candidate_repeats
     );
 
@@ -947,6 +952,7 @@ inline RagResponse run_rag_compute_carrier_baseline(ServerContext &server_contex
     response.mode_used = "carrier_baseline";
     response.query_used = request.query;
     response.generation_candidate_repeats = request.generation_candidate_repeats;
+    response.generation_subquery_decode_steps = request.generation_subquery_decode_steps;
     const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
     response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
     response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
@@ -1101,6 +1107,7 @@ inline RagResponse run_rag_compute_carrier_baseline(ServerContext &server_contex
         response.sub_queries,
         selected_context,
         request.generation_decode_steps,
+        request.generation_subquery_decode_steps,
         request.generation_candidate_repeats
     );
 
@@ -1215,13 +1222,44 @@ inline RagResponse run_rag_compute_carrier_baseline(ServerContext &server_contex
 
                 LocalDecodeExecutor decode_executor;
                 Timer decode_timer;
-                GenerationDecodeCandidate candidate = run_blocking_decode_task_from_artifact(
-                    decode_executor,
-                    generation_input,
-                    tokenizer,
-                    prefill_result,
-                    task
-                );
+                GenerationDecodeCandidate candidate;
+                if (decode_backend_used == "cpu") {
+                    powerserve::KVCacheInterface *cpu_kv = get_cpu_kv_cache_for_route(generation_context);
+                    if (cpu_kv != nullptr) {
+                        POWERSERVE_LOG_DEBUG(
+                            "compute carrier baseline decode route override: request_id={}, backend=cpu",
+                            generation_input.request_id
+                        );
+                        powerserve::ModelExecutionRoute decode_route_override{
+                            .kv_cache = cpu_kv,
+                            .ggml_kv_override = nullptr,
+                        };
+                        powerserve::ScopedModelExecutionRoute route_guard(decode_route_override);
+                        candidate = run_blocking_decode_task_from_artifact(
+                            decode_executor,
+                            generation_input,
+                            tokenizer,
+                            prefill_result,
+                            task
+                        );
+                    } else {
+                        candidate = run_blocking_decode_task_from_artifact(
+                            decode_executor,
+                            generation_input,
+                            tokenizer,
+                            prefill_result,
+                            task
+                        );
+                    }
+                } else {
+                    candidate = run_blocking_decode_task_from_artifact(
+                        decode_executor,
+                        generation_input,
+                        tokenizer,
+                        prefill_result,
+                        task
+                    );
+                }
                 generation_decode_sum_ms += decode_timer.elapsed_time_ms();
                 generation_candidates.push_back(std::move(candidate));
                 if (kv_record_created && server_context.kv_cache_manager != nullptr) {
@@ -1329,7 +1367,11 @@ inline RagResponse run_rag_compute_carrier_baseline(ServerContext &server_contex
     return response;
 }
 
-inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const RagRequest &request) {
+inline RagResponse run_rag_hetero_parallel(
+    ServerContext &server_context,
+    const RagRequest &request,
+    bool enable_critical_score = false
+) {
     using namespace powerserve;
 
     if (request.doc.empty()) {
@@ -1358,9 +1400,10 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     RagResponse response;
     response.mode_requested = request.mode;
-    response.mode_used = "hetero_parallel";
+    response.mode_used = request.mode;
     response.query_used = request.query;
     response.generation_candidate_repeats = request.generation_candidate_repeats;
+    response.generation_subquery_decode_steps = request.generation_subquery_decode_steps;
     const GenerationRoutePlan generation_route_plan = plan_generation_route(request);
     response.generation_prefill_backend_target = generation_route_plan.prefill_backend_target;
     response.generation_decode_backend_target = generation_route_plan.decode_backend_target;
@@ -1605,6 +1648,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                 query_branch.sub_queries,
                 selected_context,
                 request.generation_decode_steps,
+                request.generation_subquery_decode_steps,
                 request.generation_candidate_repeats
             );
             if (generation_tasks.size() != generation_task_count) {
@@ -1626,6 +1670,10 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
     std::vector<size_t> generation_decode_node_ids;
     generation_decode_node_ids.reserve(generation_task_count);
+    // CPU decode tasks are serialized on scheduler2's CPU worker, so a single
+    // private GGMLKV buffer can be reused across candidates instead of
+    // allocating ~3.5 GB for every candidate.
+    std::unique_ptr<powerserve::ggml::GGMLKV> reusable_private_ggml_kv;
     for (size_t i = 0; i < generation_task_count; ++i) {
         const size_t prefill_node_id = generation_prefill_base_node_id + i * 2;
         const size_t decode_node_id = prefill_node_id + 1;
@@ -1847,14 +1895,18 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
 
                 try {
                     const auto &tokenizer = *context.m_tokenizer_ptr;
-                    auto model_exec_lock = lock_model_execution(context);
+                    const bool use_private_kv_unlocked_decode = decode_route.backend == BackendKind::CPU;
+                    std::unique_lock<std::mutex> model_exec_lock;
+                    if (!use_private_kv_unlocked_decode) {
+                        model_exec_lock = lock_model_execution(context);
+                    }
                     POWERSERVE_LOG_DEBUG(
                         "scheduler2 dag decode start: request_id={}, backend={}",
                         input.request_id,
                         BackendRouter::backend_name(decode_route.backend)
                     );
 
-                    if (input.m_generation_route_enabled) {
+                    if (input.m_generation_route_enabled && !use_private_kv_unlocked_decode) {
                         if (!set_generation_backend_route(context, BackendRouter::backend_name(decode_route.backend))) {
                             POWERSERVE_LOG_WARN(
                                 "scheduler2 dag decode backend route fallback to cpu, request_id={}, target={}",
@@ -1865,7 +1917,6 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                         }
                     }
 
-                    std::unique_ptr<powerserve::ggml::GGMLKV> private_ggml_kv;
                     if (decode_route.backend == BackendKind::CPU) {
                         if (prefill_kv_snapshots[i] == nullptr) {
                             throw std::runtime_error("scheduler2 dag decode missing kv snapshot");
@@ -1874,7 +1925,12 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                         POWERSERVE_ASSERT(ggml_iter != context.m_model_ptr->m_platform->ggml_backends.end());
                         POWERSERVE_ASSERT(ggml_iter->second && ggml_iter->second->m_kv);
 
-                        private_ggml_kv = std::make_unique<powerserve::ggml::GGMLKV>(ggml_iter->second->m_kv->m_config);
+                        if (!reusable_private_ggml_kv) {
+                            reusable_private_ggml_kv = std::make_unique<powerserve::ggml::GGMLKV>(
+                                ggml_iter->second->m_kv->m_config
+                            );
+                        }
+                        auto *private_ggml_kv = reusable_private_ggml_kv.get();
                         if (prefill_kv_snapshots[i]->begin_position > 0) {
                             std::shared_ptr<powerserve::ggml::GGMLKV::Snapshot> base_snapshot;
                             {
@@ -1896,23 +1952,23 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
                         private_ggml_kv->restore_snapshot(*prefill_kv_snapshots[i]);
                         const size_t restore_ms = restore_timer.elapsed_time_ms();
                         generation_restore_ms_acc.fetch_add(restore_ms, std::memory_order_relaxed);
+                        POWERSERVE_LOG_DEBUG(
+                            "scheduler2 dag decode kv restored: request_id={}, begin={}, end={}, private_pos={}",
+                            input.request_id,
+                            prefill_kv_snapshots[i]->begin_position,
+                            prefill_kv_snapshots[i]->position,
+                            private_ggml_kv->kv_cache->position
+                        );
 
-                        powerserve::KVCacheInterface *cpu_kv = get_cpu_kv_cache_for_route(context);
-                        context.m_model_ptr->kv_cache = private_ggml_kv->kv_cache.get();
-                        context.m_model_ptr->ggml_kv_override = private_ggml_kv.get();
-                        struct GgmlKvOverrideGuard {
-                            powerserve::Model *model = nullptr;
-                            powerserve::KVCacheInterface *cpu_kv = nullptr;
-                            ~GgmlKvOverrideGuard() {
-                                if (model != nullptr) {
-                                    model->ggml_kv_override = nullptr;
-                                    if (cpu_kv != nullptr) {
-                                        model->kv_cache = cpu_kv;
-                                    }
-                                }
-                            }
-                        } kv_guard{context.m_model_ptr.get(), cpu_kv};
-                        (void)kv_guard;
+                        powerserve::ModelExecutionRoute decode_route_override{
+                            .kv_cache = private_ggml_kv->kv_cache.get(),
+                            .ggml_kv_override = private_ggml_kv,
+                        };
+                        powerserve::ScopedModelExecutionRoute route_guard(decode_route_override);
+                        POWERSERVE_LOG_INFO(
+                            "scheduler2 dag decode private-kv unlocked path: request_id={}, backend=cpu",
+                            input.request_id
+                        );
 
                         LocalDecodeExecutor decode_executor;
                         generation_candidates[i] = run_blocking_decode_task_from_artifact(
@@ -2015,7 +2071,7 @@ inline RagResponse run_rag_hetero_parallel(ServerContext &server_context, const 
     POWERSERVE_LOG_INFO("Scheduler2 submit big dag: nodes={}, edges={}", dag_nodes.size(), edge_count);
 
     try {
-        server_context.scheduler2->submit_dag(std::move(dag_nodes)).get();
+    server_context.scheduler2->submit_dag(std::move(dag_nodes), enable_critical_score).get();
     } catch (...) {
         for (size_t i = 0; i < prefill_samplers.size(); ++i) {
             prefill_samplers[i].reset();

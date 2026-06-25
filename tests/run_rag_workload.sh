@@ -38,6 +38,7 @@ esac
 #   ./tests/run_rag_workload.sh 8K pure_cpu_sequential 8gen4
 #   ./tests/run_rag_workload.sh 6K pure_npu_sequential 8gen5
 #   ./tests/run_rag_workload.sh 4K npu_cpu_baseline 8gen4
+#   ./tests/run_rag_workload.sh 4K npu_cpu_cs 8gen4
 
 LOCAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKLOADS_JSON="$LOCAL_DIR/workloads/workloads.json"
@@ -48,6 +49,8 @@ WORKLOAD="${1:-}"
 PROFILE="${2:-npu_cpu}"
 TOP_N_OVERRIDE="${RAG_TOP_N:-}"
 CANDIDATE_REPEATS_OVERRIDE="${RAG_CANDIDATE_REPEATS:-}"
+EXPANSION_MODEL_OVERRIDE="${RAG_EXPANSION_MODEL:-qwen3-0.6b-base}"
+GENERATION_MODEL_OVERRIDE="${RAG_GENERATION_MODEL:-qwen3-4b}"
 
 # Validate workload
 if [[ -z "$WORKLOAD" ]]; then
@@ -113,6 +116,11 @@ case "$PROFILE" in
     GEN_PREFILL_BACKEND="npu"
     GEN_DECODE_BACKEND="cpu"
     ;;
+  npu_cpu_cs|hetero_npu_cpu_cs)
+    MODE="npu_cpu_cs"
+    GEN_PREFILL_BACKEND="npu"
+    GEN_DECODE_BACKEND="cpu"
+    ;;
   npu_cpu_baseline|hetero_npu_cpu_baseline|carrier_baseline)
     MODE="carrier_baseline"
     GEN_PREFILL_BACKEND="npu"
@@ -120,7 +128,7 @@ case "$PROFILE" in
     ;;
   *)
     echo "unknown profile: $PROFILE" >&2
-    echo "try: pure_cpu_sequential | pure_npu_sequential | npu_cpu | npu_cpu_baseline" >&2
+    echo "try: pure_cpu_sequential | pure_npu_sequential | npu_cpu | npu_cpu_cs | npu_cpu_baseline" >&2
     exit 2
     ;;
 esac
@@ -152,6 +160,8 @@ RAG_PREFILL_BACKEND="$GEN_PREFILL_BACKEND" \
 RAG_DECODE_BACKEND="$GEN_DECODE_BACKEND" \
 RAG_TOP_N="$TOP_N_OVERRIDE" \
 RAG_CANDIDATE_REPEATS="$CANDIDATE_REPEATS_OVERRIDE" \
+RAG_EXPANSION_MODEL="$EXPANSION_MODEL_OVERRIDE" \
+RAG_GENERATION_MODEL="$GENERATION_MODEL_OVERRIDE" \
 python3 - <<'PY'
 import json
 import os
@@ -165,6 +175,8 @@ rag_prefill_backend = os.environ['RAG_PREFILL_BACKEND']
 rag_decode_backend = os.environ['RAG_DECODE_BACKEND']
 rag_top_n = os.environ.get('RAG_TOP_N', '').strip()
 rag_candidate_repeats = os.environ.get('RAG_CANDIDATE_REPEATS', '').strip()
+rag_expansion_model = os.environ.get('RAG_EXPANSION_MODEL', '').strip()
+rag_generation_model = os.environ.get('RAG_GENERATION_MODEL', '').strip()
 
 payload = json.loads(src_payload.read_text(encoding='utf-8'))
 payload['doc'] = doc_source.read_text(encoding='utf-8')
@@ -181,6 +193,10 @@ if rag_candidate_repeats:
     if candidate_repeats <= 0:
         raise ValueError('RAG_CANDIDATE_REPEATS must be > 0')
     payload['generation_candidate_repeats'] = candidate_repeats
+if rag_expansion_model:
+    payload['expansion_model'] = rag_expansion_model
+if rag_generation_model:
+    payload['generation_model'] = rag_generation_model
 # Ensure decode steps and max_tokens are consistent
 payload['generation_decode_steps'] = 64
 payload['max_tokens'] = 64

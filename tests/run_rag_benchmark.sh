@@ -7,6 +7,7 @@ set -euo pipefail
 #
 # Examples:
 #   ./tests/run_rag_benchmark.sh npu_cpu
+#   ./tests/run_rag_benchmark.sh npu_cpu_cs
 #   ./tests/run_rag_benchmark.sh pure_cpu_sequential
 #   ./tests/run_rag_benchmark.sh pure_npu_sequential
 
@@ -102,9 +103,10 @@ import json
 with open('$RESULT_FILE') as f:
     data = json.load(f)
 print('{:<8} {:<18} {:<12} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10}'.format(
-    'Workload', 'Mode', 'Total(ms)', 'Indexing', 'Embedding', 'QueryEmb', 'Search', 'Rerank', 'Gen'
+    'Workload', 'ModeReq/Used', 'Total(ms)', 'Indexing', 'Embedding', 'QueryEmb', 'Search', 'Rerank', 'Gen'
 ))
 print('-' * 100)
 for row in data:
-    print(f\"{row['workload']:<8} {row['mode_used']:<18} {row['total_ms']:<12.1f} {row['indexing_ms']:<10.1f} {row['embedding_ms']:<10.1f} {row['query_embedding_ms']:<10.1f} {row['searching_ms']:<10.1f} {row['reranking_ms']:<10.1f} {row['generation_ms']:<10.1f}\")
+    mode_pair = f\"{row['mode_requested']}/{row['mode_used']}\"
+    print(f\"{row['workload']:<8} {mode_pair:<18} {row['total_ms']:<12.1f} {row['indexing_ms']:<10.1f} {row['embedding_ms']:<10.1f} {row['query_embedding_ms']:<10.1f} {row['searching_ms']:<10.1f} {row['reranking_ms']:<10.1f} {row['generation_ms']:<10.1f}\")
 "

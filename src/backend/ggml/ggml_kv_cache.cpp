@@ -166,6 +166,10 @@ void GGMLKV::restore_snapshot(const Snapshot &snapshot) {
         }
         POWERSERVE_ASSERT(src_flat == value_layer_size);
     }
+    // Restore position only. Rebuilding the full attention mask here is
+    // expensive for large n_ctx and is unnecessary for CPU decode, which
+    // constructs the mask on-the-fly from position. QNN paths that need
+    // attn_bias are responsible for refreshing it before forward.
     kv_cache->position = snapshot.position;
 }
 

@@ -2,9 +2,11 @@
 
 #include "core/logger.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <atomic>
 #include <exception>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -16,6 +18,75 @@ namespace {
 
 bool should_enqueue_cpu(BackendKind backend) {
     return backend == BackendKind::CPU || backend == BackendKind::AUTO;
+}
+
+// 4K profiling-derived estimates from the npu_cpu_cs run. Scores model the
+// approximate remaining critical-path milliseconds from a node to DAG finish.
+constexpr double kProfile4kIndexingMs = 5086.0;
+constexpr double kProfile4kQueryExpandMs = 1115.0;
+constexpr double kProfile4kQueryEmbeddingTotalMs = 1242.0;
+constexpr double kProfile4kRetrievalBranchCount = 3.0;
+constexpr double kProfile4kQueryEmbeddingNodeMs =
+    kProfile4kQueryEmbeddingTotalMs / kProfile4kRetrievalBranchCount;
+constexpr double kProfile4kSearchingMs = 16.0;
+constexpr double kProfile4kRerankingMs = 4401.0;
+constexpr double kProfile4kGenerationMs = 26973.0;
+constexpr double kProfile4kGenerationPrefillMs = 2283.0;
+constexpr double kProfile4kGenerationDecodeMs = 26179.0;
+
+constexpr double kScoreGenerationMerge = 1.0;
+constexpr double kScoreGenerationDecode = kProfile4kGenerationDecodeMs;
+constexpr double kScoreGenerationPrefill = kProfile4kGenerationPrefillMs + kScoreGenerationDecode;
+constexpr double kScoreReranking = kProfile4kRerankingMs + kProfile4kGenerationMs;
+constexpr double kScoreSearching = kProfile4kSearchingMs + kScoreReranking;
+constexpr double kScoreQueryEmbedding = kProfile4kQueryEmbeddingNodeMs + kScoreSearching;
+constexpr double kScoreQueryExpand = kProfile4kQueryExpandMs + kProfile4kQueryEmbeddingTotalMs + kScoreSearching;
+constexpr double kScoreIndexing = kProfile4kIndexingMs + kScoreSearching;
+
+double critical_score_for_node(const Scheduler2DagNode &node) {
+    if (!node.debug_name.empty()) {
+        if (node.debug_name == "generation_merge") {
+            return kScoreGenerationMerge;
+        }
+        if (node.debug_name.rfind("generation_decode_", 0) == 0) {
+            return kScoreGenerationDecode;
+        }
+        if (node.debug_name.rfind("generation_prefill_", 0) == 0) {
+            return kScoreGenerationPrefill;
+        }
+        if (node.debug_name == "reranking") {
+            return kScoreReranking;
+        }
+        if (node.debug_name.rfind("searching_", 0) == 0) {
+            return kScoreSearching;
+        }
+        if (node.debug_name.rfind("query_embedding_", 0) == 0) {
+            return kScoreQueryEmbedding;
+        }
+        if (node.debug_name == "query_expand") {
+            return kScoreQueryExpand;
+        }
+        if (node.debug_name == "indexing") {
+            return kScoreIndexing;
+        }
+    }
+    switch (node.type) {
+    case Scheduler2TaskType::GENERATION_DECODE:
+        return kScoreGenerationDecode;
+    case Scheduler2TaskType::GENERATION_PREFILL:
+        return kScoreGenerationPrefill;
+    case Scheduler2TaskType::UNKNOWN:
+    default:
+        return 10.0;
+    }
+}
+
+bool can_steal_task(BackendKind worker_backend, const Scheduler2Task &task) {
+    if (task.type == Scheduler2TaskType::GENERATION_PREFILL ||
+        task.type == Scheduler2TaskType::GENERATION_DECODE) {
+        return task.backend == worker_backend;
+    }
+    return true;
 }
 
 } // namespace
@@ -45,15 +116,29 @@ void Scheduler2::enqueue_task(Scheduler2Task task) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (should_enqueue_cpu(task.backend)) {
-            cpu_queue_.push_back(std::move(task));
+            auto insert_pos = cpu_queue_.end();
+            for (auto iter = cpu_queue_.begin(); iter != cpu_queue_.end(); ++iter) {
+                if (task.critical_score > iter->critical_score) {
+                    insert_pos = iter;
+                    break;
+                }
+            }
+            cpu_queue_.insert(insert_pos, std::move(task));
         } else {
-            npu_queue_.push_back(std::move(task));
+            auto insert_pos = npu_queue_.end();
+            for (auto iter = npu_queue_.begin(); iter != npu_queue_.end(); ++iter) {
+                if (task.critical_score > iter->critical_score) {
+                    insert_pos = iter;
+                    break;
+                }
+            }
+            npu_queue_.insert(insert_pos, std::move(task));
         }
     }
-    cv_.notify_one();
+    cv_.notify_all();
 }
 
-std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
+std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes, bool enable_critical_score) {
     auto graph_promise = std::make_shared<std::promise<void>>();
     std::future<void> graph_future = graph_promise->get_future();
 
@@ -78,6 +163,20 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
             return graph_future;
         }
         node_map->emplace(node.node_id, std::move(node));
+    }
+
+    if (enable_critical_score) {
+        for (auto &[node_id, node] : *node_map) {
+            node.critical_score = critical_score_for_node(node);
+            POWERSERVE_LOG_DEBUG(
+                "Scheduler2 critical_score init: node_id={}, name={}, type={}, backend={}, score={}",
+                node_id,
+                node.debug_name,
+                scheduler2_task_type_name(node.type),
+                BackendRouter::backend_name(node.backend),
+                node.critical_score
+            );
+        }
     }
 
     auto indegree = std::make_shared<std::unordered_map<size_t, size_t>>();
@@ -149,9 +248,25 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
     auto finished = std::make_shared<std::atomic_bool>(false);
     auto fail_mutex = std::make_shared<std::mutex>();
     auto first_error = std::make_shared<std::exception_ptr>();
+    auto enqueue_order = std::make_shared<std::vector<std::string>>();
+    auto enqueue_order_mutex = std::make_shared<std::mutex>();
+    auto log_enqueue_order = std::make_shared<std::function<void(const char *)>>();
+    *log_enqueue_order = [enqueue_order, enqueue_order_mutex](const char *status) {
+        std::ostringstream summary;
+        {
+            std::lock_guard<std::mutex> lock(*enqueue_order_mutex);
+            for (size_t i = 0; i < enqueue_order->size(); ++i) {
+                if (i > 0) {
+                    summary << " -> ";
+                }
+                summary << (*enqueue_order)[i];
+            }
+        }
+        POWERSERVE_LOG_INFO("Scheduler2 critical order summary ({}): {}", status, summary.str());
+    };
 
-    auto enqueue_ready = std::make_shared<std::function<void(size_t)>>();
-    *enqueue_ready = [this,
+    auto enqueue_child = std::make_shared<std::function<void(size_t)>>();
+    *enqueue_child = [this,
                       node_map,
                       indegree,
                       children,
@@ -162,12 +277,33 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
                       graph_promise,
                       fail_mutex,
                       first_error,
-                      enqueue_ready](size_t node_id) {
+                      enable_critical_score,
+                      enqueue_order,
+                      enqueue_order_mutex,
+                      log_enqueue_order,
+                      enqueue_child](size_t node_id) {
         const auto node_iter = node_map->find(node_id);
         if (node_iter == node_map->end()) {
             return;
         }
         const Scheduler2DagNode &node = node_iter->second;
+        if (enable_critical_score) {
+            POWERSERVE_LOG_DEBUG(
+                "Scheduler2 enqueue node: name={}, node_id={}, type={}, backend={}, critical_score={}",
+                node.debug_name,
+                node.node_id,
+                scheduler2_task_type_name(node.type),
+                BackendRouter::backend_name(node.backend),
+                node.critical_score
+            );
+            std::ostringstream item;
+            item << node.debug_name
+                 << "#id=" << node.node_id
+                 << "#backend=" << BackendRouter::backend_name(node.backend)
+                 << "#score=" << node.critical_score;
+            std::lock_guard<std::mutex> lock(*enqueue_order_mutex);
+            enqueue_order->push_back(item.str());
+        }
         this->enqueue_task(Scheduler2Task{
             .type = node.type,
             .request_id = node.request_id,
@@ -183,7 +319,9 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
                    graph_promise,
                    fail_mutex,
                    first_error,
-                   enqueue_ready]() {
+                   enable_critical_score,
+                   log_enqueue_order,
+                   enqueue_child]() {
                 if (failed->load()) {
                     return;
                 }
@@ -200,6 +338,9 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
 
                 if (failed->load()) {
                     if (!finished->exchange(true)) {
+                        if (enable_critical_score) {
+                            (*log_enqueue_order)("failed");
+                        }
                         std::exception_ptr err;
                         {
                             std::lock_guard<std::mutex> lock(*fail_mutex);
@@ -218,6 +359,9 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
                 const size_t done = completed->fetch_add(1) + 1;
                 if (done == node_map->size()) {
                     if (!finished->exchange(true)) {
+                        if (enable_critical_score) {
+                            (*log_enqueue_order)("completed");
+                        }
                         graph_promise->set_value();
                     }
                     return;
@@ -236,18 +380,53 @@ std::future<void> Scheduler2::submit_dag(std::vector<Scheduler2DagNode> nodes) {
                         }
                     }
                 }
+                if (enable_critical_score) {
+                    std::sort(ready_children.begin(), ready_children.end(), [node_map](size_t lhs, size_t rhs) {
+                        const auto &left = node_map->at(lhs);
+                        const auto &right = node_map->at(rhs);
+                        if (left.critical_score != right.critical_score) {
+                            return left.critical_score > right.critical_score;
+                        }
+                        return left.node_id < right.node_id;
+                    });
+                }
                 for (const size_t child : ready_children) {
-                    (*enqueue_ready)(child);
+                    (*enqueue_child)(child);
                 }
             },
             .enqueued_at = std::chrono::steady_clock::now(),
         });
     };
 
+    std::vector<size_t> root_nodes;
     for (const auto &[node_id, deg] : *indegree) {
         if (deg == 0) {
-            (*enqueue_ready)(node_id);
+            root_nodes.push_back(node_id);
         }
+    }
+    if (enable_critical_score) {
+        std::sort(root_nodes.begin(), root_nodes.end(), [node_map](size_t lhs, size_t rhs) {
+            const auto &left = node_map->at(lhs);
+            const auto &right = node_map->at(rhs);
+            if (left.critical_score != right.critical_score) {
+                return left.critical_score > right.critical_score;
+            }
+            return left.node_id < right.node_id;
+        });
+        for (const size_t root_node_id : root_nodes) {
+            const auto &node = node_map->at(root_node_id);
+            POWERSERVE_LOG_DEBUG(
+                "Scheduler2 root node candidate: name={}, node_id={}, type={}, backend={}, critical_score={}",
+                node.debug_name,
+                node.node_id,
+                scheduler2_task_type_name(node.type),
+                BackendRouter::backend_name(node.backend),
+                node.critical_score
+            );
+        }
+    }
+    for (const size_t root_node_id : root_nodes) {
+        (*enqueue_child)(root_node_id);
     }
 
     POWERSERVE_LOG_INFO("Scheduler2 submit dag: nodes={}, roots={}", node_map->size(), zero_indegree_count);
@@ -275,8 +454,16 @@ void Scheduler2::worker_loop(BackendKind worker_backend) {
         Scheduler2Task task;
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this]() {
-                return shutdown_ || !cpu_queue_.empty() || !npu_queue_.empty();
+            cv_.wait(lock, [this, worker_backend]() {
+                if (shutdown_) {
+                    return true;
+                }
+                if (worker_backend == BackendKind::CPU) {
+                    return !cpu_queue_.empty() ||
+                        (!npu_queue_.empty() && can_steal_task(worker_backend, npu_queue_.front()));
+                }
+                return !npu_queue_.empty() ||
+                    (!cpu_queue_.empty() && can_steal_task(worker_backend, cpu_queue_.front()));
             });
 
             if (shutdown_ && cpu_queue_.empty() && npu_queue_.empty()) {
@@ -295,12 +482,12 @@ void Scheduler2::worker_loop(BackendKind worker_backend) {
             bool popped = false;
             if (worker_backend == BackendKind::CPU) {
                 popped = pop_from_queue(cpu_queue_, task);
-                if (!popped) {
+                if (!popped && !npu_queue_.empty() && can_steal_task(worker_backend, npu_queue_.front())) {
                     popped = pop_from_queue(npu_queue_, task); // steal
                 }
             } else {
                 popped = pop_from_queue(npu_queue_, task);
-                if (!popped) {
+                if (!popped && !cpu_queue_.empty() && can_steal_task(worker_backend, cpu_queue_.front())) {
                     popped = pop_from_queue(cpu_queue_, task); // steal
                 }
             }
