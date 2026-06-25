@@ -1533,6 +1533,10 @@ public:
             .input_prompt = input_prompt,
             .enqueued_at  = std::chrono::steady_clock::now(),
         };
+        // Plain /completion requests are not segmented RAG tasks; decode fully
+        // instead of using the GenerationDecodeTask default of 1 step.
+        task.decode_task.max_decode_steps = 0;
+
         std::future<ModelOutput> result_future = task.result_promise.get_future();
 
         {

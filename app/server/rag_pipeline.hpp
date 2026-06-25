@@ -639,6 +639,26 @@ inline std::string maybe_expand_rag_query(
     printf("Query expansion output: %s\n", expand_output.m_text.c_str());
     query_expand_ms = stage_timer.elapsed_time_ms();
 
+    // Free the expansion model before loading embedding/rerank models.
+    // Large generation models (e.g. qwen3-4b) hold big QNN shared buffers;
+    // keeping them resident while loading the embedding model can exhaust
+    // NPU shared memory and cause memRegister to fail.
+    if (model_for_expand != request.embedding_model && model_for_expand != request.rerank_model) {
+        POWERSERVE_LOG_INFO(
+            "[debug] unloading expansion model '{}' before embedding stages",
+            model_for_expand
+        );
+        server_context.destroy_model(model_for_expand);
+        POWERSERVE_LOG_INFO("[debug] expansion model '{}' unloaded", model_for_expand);
+    } else {
+        POWERSERVE_LOG_INFO(
+            "[debug] skip expansion model unload: expand='{}' embedding='{}' rerank='{}'",
+            model_for_expand,
+            request.embedding_model,
+            request.rerank_model
+        );
+    }
+
     const std::string candidate = rag_trim(rag_first_line(expand_output.m_text));
     return candidate.empty() ? request.query : candidate;
 }
