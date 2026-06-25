@@ -182,8 +182,8 @@ if rag_candidate_repeats:
         raise ValueError('RAG_CANDIDATE_REPEATS must be > 0')
     payload['generation_candidate_repeats'] = candidate_repeats
 # Ensure decode steps and max_tokens are consistent
-payload['generation_decode_steps'] = 256
-payload['max_tokens'] = 256
+payload['generation_decode_steps'] = 64
+payload['max_tokens'] = 64
 
 local_payload.write_text(
     json.dumps(payload, ensure_ascii=False),
