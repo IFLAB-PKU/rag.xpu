@@ -1,322 +1,509 @@
-# PowerServe
-PowerServe is a high-speed and easy-use LLM serving framework for local deployment.
+# HybridRAG
 
-## Features
-- [One-click compilation and deployment](./docs/end_to_end.md)
-- NPU speculative inference support
-- Achieves 40 tokens/s running Smallthinker on mobile devices
-- Support Android and HarmonyOS NEXT
+A heterogeneous RAG inference system for mobile NPU/CPU devices, built on the Qwen3 model family. It runs an end-to-end retrieval-augmented generation pipeline with NPU prefill and CPU decode orchestration, targeting Qualcomm Snapdragon platforms via QNN.
 
-## Supported Models
+> This project evolves from the [PowerServe](https://github.com/powerserve-project/PowerServe) LLM serving framework. The original README has been superseded by this document.
 
-Here's the list of models that PowerServe supports:
-
-| Model Name | Hugging Face Link | Speculation Support(Draft model) | Soc Setting | Prefill Speed (tokens/s) | Decode Speed (tokens/s) | Speculative Decode Speed (tokens/s) |
-|---|---|---|---|---|---|---|
-| smallthinker-3b | [SmallThinker-3B](https://huggingface.co/PowerServe/SmallThinker-3B-PowerServe-QNN29-8G3) | Yes(smallthinker-0.5b) | 8G3 | 975.00 | 19.71 | 38.75 |
-| llama-3.2-1b | [Llama-3.2-1B](https://huggingface.co/PowerServe/Llama-3.2-1B-PowerServe-QNN29-8G3) | No | 8G3 | 1876.58 | 58.99 | / |
-| llama-3.1-8b | [Llama-3.1-8B](https://huggingface.co/PowerServe/Llama-3.1-8B-PowerServe-QNN29-8G3) | Yes(llama-3.2-1b) | 8G3 | 468.35 | 12.03 | 21.02 |
-| qwen-2-0.5b | [Qwen-2-0.5B](https://huggingface.co/PowerServe/Qwen-2-0.5B-PowerServe-QNN29-8G3) | No | 8G3 | 3590.91 | 104.53 | / |
-| qwen-2.5-3b | [Qwen-2.5-3B](https://huggingface.co/PowerServe/Qwen-2.5-3B-PowerServe-QNN29-8G3) | No | 8G3 | 906.98 | 21.01 | / |
-| internlm-3-8b | [InternLM-3-8B](https://huggingface.co/PowerServe/InternLM-3-8B-PowerServe-QNN29-8G3) | No | 8G3 | TBC | TBC | / |
-| deepseek-r1-llama-8b | [DeepSeek-R1-Distill-Llama-8B](https://huggingface.co/PowerServe/DeepSeek-R1-Distill-Llama-8B-PowerServe-QNN29-8G3/tree/main) | Yes(llama-3.2-1b) | 8G3 | TBC | TBC | / |
-| smallthinker-3b | [SmallThinker-3B](https://huggingface.co/PowerServe/SmallThinker-3B-PowerServe-QNN29-8G4) | Yes(smallthinker-0.5b) | 8G4(8Elite) | 1052.63 | 20.90 | 43.25 |
-| llama-3.2-1b | [Llama-3.2-1B](https://huggingface.co/PowerServe/Llama-3.2-1B-PowerServe-QNN29-8G4) | No | 8G4(8Elite) | 1952.38 | 59.00 | / |
-| llama-3.1-8b | [Llama-3.1-8B](https://huggingface.co/PowerServe/Llama-3.1-8B-PowerServe-QNN29-8G4) | Yes(llama-3.2-1b) | 8G4(8Elite) | 509.09 | 12.48 | 22.83 |
-| qwen-2-0.5b | [Qwen-2-0.5B](https://huggingface.co/PowerServe/Qwen-2-0.5B-PowerServe-QNN29-8G4) | No | 8G4(8Elite) | 4027.30 | 109.49 | / |
-| qwen-2.5-3b | [Qwen-2.5-3B](https://huggingface.co/PowerServe/Qwen-2.5-3B-PowerServe-QNN29-8G4) | No | 8G4(8Elite) | 981.69 | 22.19 | / |
-| internlm-3-8b | [InternLM-3-8B](https://huggingface.co/PowerServe/InternLM-3-8B-PowerServe-QNN29-8G4) | No | 8G4(8Elite) | 314.80 | 7.62 | / |
-| deepseek-r1-llama-8b | [DeepSeek-R1-Distill-Llama-8B](https://huggingface.co/PowerServe/DeepSeek-R1-Distill-Llama-8B-PowerServe-QNN29-8G4/tree/main) | Yes(llama-3.2-1b) | 8G4(8Elite) | 336.37 | 10.21 | / |
-
-We test these speeds with files in `./assets/prompts`as input prompt files. More tests on multiple datasets will be conducted in the future.
-
-## News
-- [2025/1/14] We release PowerServe 🎉
-- [2025/4/22] Bug fixes, more debug tools, backward compatability on more Qualcomm hardwares and more QOL updates. Check the new features and improvements in the [release notes](#release-notes).
+---
 
 ## Table of Contents
 
-1. [End to end deployment](#end-to-end)
-2. [Prerequisites](#prerequisites)
-3. [Directory Structure](#directory-structure)
-4. [Model Preparation](#model-preparation)
-5. [Compile PowerServe](#compile-powerserve)
-6. [Prepare PowerServe Workspace](#prepare-powerserve-workspace)
-7. [Execution](#execution)
-8. [Known Issues](#known-issues)
-9. [Release Notes](#release-notes)
+1. [Features](#features)
+2. [Supported Models](#supported-models)
+3. [Architecture](#architecture)
+4. [Directory Structure](#directory-structure)
+5. [Prerequisites](#prerequisites)
+6. [Model Preparation](#model-preparation)
+7. [Build](#build)
+8. [Deploy](#deploy)
+9. [How to Test](#how-to-test)
+10. [API Examples](#api-examples)
+11. [Known Issues](#known-issues)
 
-## End to End Deployment
+---
 
-We provide nearly one-click end to end deployment document(./docs/end_to_end.md), including model downloading, compiling, deploying, and running.
+## Features
 
-No matter what operating systems you are using, you can follow the instructions in the document to use Powerserve to run support models on your phone.
+- **End-to-end RAG pipeline** with 6 stages: indexing, query expansion, query embedding, searching, reranking, and generation.
+- **Heterogeneous execution**: NPU prefill + CPU decode for generation, CPU-based embedding/reranking/FAISS retrieval.
+- **Qwen3 model family support**: base, embedding, reranker, and 4B generation models.
+- **Prefill/Decode (PD) orchestration** with KV snapshot isolation, NPU-to-CPU KV bridge, and private KV decode.
+- **scheduler2 DAG scheduler**: full RAG pipeline expressed as a dependency graph, with FIFO or critical-score scheduling modes.
+- **OpenAI-compatible endpoints**: `/completions`, `/chat/completions`, `/embeddings`, `/rerank`, `/rag`.
 
-Details please refer to [End to End Deployment](./docs/end_to_end.md)
+---
 
+## Supported Models
+
+| Model | Role | Backend |
+|-------|------|---------|
+| `qwen3-0.6b-base` | Generation / Query expansion | CPU / NPU |
+| `qwen3-4b` | Main generation model | CPU / NPU |
+| `qwen3-embedding-0.6b` | Document/query embedding | CPU / NPU(experimental) |
+| `qwen3-reranker-0.6b` | Reranking | CPU / NPU |
+
+In the default RAG pipeline:
+
+- **Indexing** and **query embedding** use `qwen3-embedding-0.6b`.
+- **Query expansion** (optional) uses `qwen3-0.6b-base`, which is unloaded after expansion to avoid NPU shared-memory conflicts.
+- **Reranking** uses `qwen3-reranker-0.6b`.
+- **Generation** uses `qwen3-4b` (or `qwen3-0.6b-base` if configured).
+
+---
+
+## Architecture
+
+### RAG Pipeline
+
+```
+Document  →  Indexing  →  Document Embeddings
+                                        ↓
+Query → Query Expansion → Query Embedding → Searching (FAISS) → Reranking → Generation → Answer
+```
+
+The 6 stages are:
+
+1. **Indexing**: Split the document into chunks and encode them with the embedding model.
+2. **Query Expansion** (optional): Rewrite the user query into several sub-queries.
+3. **Query Embedding**: Encode the original query and sub-queries.
+4. **Searching**: Retrieve top-K chunks per query with FAISS `IndexFlatIP`, then merge and deduplicate.
+5. **Reranking**: Score query-chunk pairs and return top-N context chunks.
+6. **Generation**: Produce one or more answer candidates using the selected context, then merge them.
+
+### Execution Modes
+
+The `/rag` endpoint selects the execution mode via the `mode` field:
+
+| Mode | Scheduler | Generation Prefill | Generation Decode |
+|------|-----------|-------------------|-------------------|
+| `sequential` | Single backend, serial | `cpu` or `npu` | Same as prefill |
+| `carrier_baseline` | `std::async` parallelism + serial generation | `npu` | `cpu` |
+| `hetero_parallel` | scheduler2 DAG, FIFO + work stealing | `npu` | `cpu` |
+| `npu_cpu_cs` | scheduler2 DAG + critical-score scheduling | `npu` | `cpu` |
+
+The last two modes are the focus of the project. They use NPU for high-throughput prefill and CPU for low-latency decode, while the scheduler2 DAG expresses the whole pipeline as dependencies.
+
+### Prefill / Decode Orchestration
+
+- `PDOrchestrator` dispatches prefill and decode tasks to dedicated workers.
+- `set_generation_backend_route()` switches the active KV cache between CPU (GGML) and NPU (QNN).
+- After NPU prefill, `sync_qnn_kv_to_cpu()` copies the KV state to CPU memory.
+- `GGMLKV::save_snapshot/restore_snapshot` captures the CPU KV cache. In scheduler2 mode, a **base+delta** snapshot is used: the shared prefix is saved once and each candidate restores only its delta, lowering memory and restore cost.
+- CPU decode uses a **private KV** via a thread-local `ModelExecutionRoute`, so it does not corrupt shared model state while the next NPU prefill overlaps.
+
+### scheduler2
+
+`scheduler2` (`src/scheduler2/`) is a CPU+NPU DAG executor:
+
+- Tasks are submitted as `Scheduler2DagNode`s with explicit dependencies.
+- Two workers consume a CPU queue and an NPU queue.
+- By default, workers can steal non-generation tasks across backends to maximize utilization.
+- In `npu_cpu_cs` mode, tasks are ordered by a profile-derived critical score and generation tasks are pinned to their target backend.
+
+---
+
+## Directory Structure
+
+```
+HybridRAG/
+├── app/
+│   └── server/            # HTTP server, RAG pipeline, OpenAI-compatible handlers
+├── src/
+│   ├── backend/           # GGML and QNN backends
+│   ├── model/qwen3/       # Qwen3 model implementation
+│   ├── scheduler2/        # DAG scheduler, backend router, KV cache manager
+│   └── ...
+├── tests/                 # Test scripts and workload documents
+│   ├── run_server.sh
+│   ├── run_rag_once.sh
+│   ├── run_rag_workload.sh
+│   ├── run_rag_benchmark.sh
+│   └── workloads/
+├── tools/
+│   ├── gguf_export.py     # CPU model conversion
+│   └── qnn_converter/     # NPU model conversion
+├── docs/                  # Design and phase documents
+├── README.md
+└── requirements.txt
+```
+
+---
 
 ## Prerequisites
+
+- Linux host with Docker (recommended)
+- Android NDK
+- Qualcomm QNN SDK
+- `adb` and an Android device with USB debugging
+- Python dependencies:
 
 ```bash
 pip install -r requirements.txt
 git submodule update --init --recursive
 ```
 
-To deploy on aarch64 with Qualcomm NPU using QNN, [**NDK**](https://developer.android.google.cn/ndk/downloads) and [**QNN**](https://docs.qualcomm.com/bundle/publicresource/topics/80-63442-50/linux_setup.html) are required to be installed.
+Set the usual environment variables inside your build container:
 
-```shell
-export NDK=<path-to-ndk>
-export QNN_SDK_ROOT=<path-to-QNN>
+```bash
+export ANDROID_NDK=<path-to-ndk>
+export QNN_SDK=<path-to-qnn>
+source $QNN_SDK/bin/envsetup.sh
 ```
-## directory-structure
-```
-powerserve
-├── app
-├── assets               # Prompt files.
-├── CMakeLists.txt
-├── docs
-├── libs                 # External dependencies.
-├── LICENSE
-├── powerserve           # Python script to create work directory.
-├── pyproject.toml
-├── README.md
-├── requirements.txt
-├── src
-│   ├── backend          # Backend implementations, include ggml and qnn.
-│   ├── CMakeLists.txt
-│   ├── core             # Core structures used across all levels of the runtime, like type definition, config, tensor and buffer.
-│   ├── executor         # Tensor execution.
-│   ├── graph            # Computing Graph.
-│   ├── model            # Various model implementations.
-│   ├── sampler          # Token sampler.
-│   ├── speculative      # Speculative decoding.
-│   ├── storage          # File loader.
-│   └── tokenizer
-├── tests
-└── tools
-    ├── add_license.py
-    ├── CMakeLists.txt
-    ├── convert_hf_to_gguf   # Convert huggingface to gguf, based on llama.cpp
-    ├── cos_sim.py
-    ├── end_to_end
-    ├── extract_embd_from_vl
-    ├── format.py
-    ├── gen_flame_graph.sh
-    ├── gguf_config_to_json  # Export config.json from gguf.
-    ├── gguf_export.py
-    ├── mmlu
-    ├── mmmu_test
-    ├── parameter_search
-    ├── qnn_converter
-    └── simple_qnn_test
-```
+
+---
 
 ## Model Preparation
 
-For CPU-only execution, only `Models For CPU` is required. For NPU execution, both `Models For CPU` and `Models For NPU` is required.
+### 1. Download Hugging Face Models
 
-Take llama3.1-8b-instruct model as example, the structure of model folder:
-```shell
--- models                       # Level-1 dir, where server search different models and CLI search for runtime configurations
-    -- hparams.json                 # Hyper params, containing #threads, #batch_size and sampler configurations.
-    -- workspace.json               # The definition of model workspace structure, where main model and target model(if exist) is determined.
-    -- bin                          # The binaries for execution
-        -- powerserve-config-generator
-        -- powerserve-perplexity-test
-        -- powerserve-run
-        -- powerserve-server
-    -- qnn_libs                     # Dependent libraries of QNN
-        -- libQNNSystem.so
-        -- libQNNHtp.so
-        -- libQNNHtpV79.so
-        -- libQNNHtpV79Skel.so
-        -- libQNNHtpV79Stub.so
-    -- llama3.1-8b-instruct         # The model weights of GGUF and QNN
-        -- model.json
-        -- vocab.gguf               # The vocab table of model
-        -- ggml                     # GGUF model binaries
-            -- weights.gguf
-        -- qnn                      # QNN model binaries
-            -- kv
-                -- *.raw
-                -- ...
-            -- config.json          # The information of QNN models and QNN backend configurations
-            -- llama3_1_8b_0.bin
-            -- llama3_1_8b_1.bin
-            -- llama3_1_8b_2.bin
-            -- llama3_1_8b_3.bin
-            -- lmhead.bin
-    -- qwen2_7b_instruct            # another model
-        -- ...
+Download the Qwen3 checkpoints you need, for example:
 
+- `Qwen/Qwen3-0.6B-Base`
+- `Qwen/Qwen3-4B`
+- `Qwen/Qwen3-Embedding-0.6B`
+- `Qwen/Qwen3-Reranker-0.6B`
+
+### 2. Convert CPU Model (GGUF)
+
+```bash
+python ./tools/gguf_export.py \
+    -m <path-to-hf-model> \
+    -o models/<model-name>
 ```
 
-### Convert Models For CPU
+### 3. Convert NPU Model (QNN)
 
-```shell
-# Under the root directory of PowerServe
-python ./tools/gguf_export.py -m <hf-model> -o models/llama3.1-8b-instruct
-```
+Follow `tools/qnn_converter/README.md`. A typical flow is:
 
+```bash
+cd tools/qnn_converter
 
-### Convert Models For NPU
-
-If you just want to run PowerServe on CPUs, this step can be skipped. More details please refer to [QNN Model Conversion](./tools/qnn_converter/README.md)
-
-```shell
-# Under the root directory of PowerServe
-cd powerserve/tools/qnn_converter
-
-# This may take a long time...
-python converter.py                                 \
-    --model-folder Llama-3.1-8B-Instruct            \
-    --model-name llama3_1_8b                        \
-    --system-prompt-file system_prompt_llama.txt    \
-    --prompt-file lab_intro_llama.md                \
-    --batch-sizes 1 128                             \
-    --artifact-name llama3_1_8b                     \
-    --n-model-chunk 4                               \
-    --output-folder ./llama3.1-8b-QNN               \
-    --build-folder ./llama3.1-8b-QNN-tmp            \
+python converter.py \
+    --model-folder <path-to-hf-model> \
+    --model-name <model-name> \
+    --system-prompt-file <system-prompt-file> \
+    --prompt-file <prompt-file> \
+    --batch-sizes 1 128 \
+    --artifact-name <artifact-name> \
+    --n-model-chunk <n> \
+    --output-folder ./<output> \
+    --build-folder ./<tmp> \
     --silent \
     --clear-build-files \
-    --soc 8650
-
-```
-Convert GGUF models and integrate them with QNN models
-
-Note: this scripts can only create fp32 and q8_0 in ./llama3.1-8b-instruct-model/ggml/weights.gguf,
-if you want to use q4_0, please use llama-quantize in llama.cpp like: `./build/bin/llama-quantize --pure /<path>/llama3.1-fp32.gguf Q4_0`, then replace weight file: `cp /<path>/ggml-model-Q4_0.gguf ./llama3.1-8b-instruct-model/ggml/weights.gguf`
-
-```shell
-# Under the root directory of PowerServe
-python ./tools/gguf_export.py -m <hf-llama3.1-model> --qnn-path tools/qnn_converter/llama3.1-8b-QNN -o ./llama3.1-8b-instruct-model
+    --soc <soc-number>
 ```
 
-## Compile PowerServe
+Then merge the QNN artifacts into the GGUF model:
 
-The options of platform and ABI vary when deploying on different devices. DO CARE about the configuration.
-
-### Build for Linux cpu
-```shell
-# Under the root directory of PowerServe
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+```bash
+python ./tools/gguf_export.py \
+    -m <path-to-hf-model> \
+    --qnn-path tools/qnn_converter/<output> \
+    -o ./<model-name>-model
 ```
 
-### Build for Android cpu
-```shell
-# Under the root directory of PowerServe
-cmake -B build                                                      \
-    -DCMAKE_BUILD_TYPE=Release                                      \
-    -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-    -DANDROID_ABI=arm64-v8a                                         \
-    -DANDROID_PLATFORM=android-35                                   \
-    -DGGML_OPENMP=OFF                                               \
-    -DPOWERSERVE_WITH_QNN=OFF
+### 4. Create PowerServe Workspace
 
-cmake --build build
+```bash
+mkdir -p models
+./powerserve create \
+    -m ./<model-name>-model \
+    --exe-path ./build/out \
+    -o ./models/<model-name>
 ```
 
-### Build for Android qnn
-- ❗️ Because the llama3.1-8b model is too large, qnn needs to open multiple sessions when loading. We conducted tests on 4 mobile phones. Among them, one plus 12, one plus 13 and Xiaomi 14 need to be updated to android 15 to apply for additional sessions in non-root mode, while honor Magic6 updates to android 15 to run in non-root mode will cause an error.
+Repeat for each model. The final on-device layout should look like:
 
-```shell
-# Under the root directory of PowerServe
-cmake -B build                                                      \
-    -DCMAKE_BUILD_TYPE=Release                                      \
-    -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
-    -DANDROID_ABI=arm64-v8a                                         \
-    -DANDROID_PLATFORM=android-35                                   \
-    -DGGML_OPENMP=OFF                                               \
-    -DPOWERSERVE_WITH_QNN=ON                                        \
-    -DPOWERSERVE_ENABLE_HTPRPCPOLL=ON                               \
-    -DPOWERSERVE_ENABLE_HMXPWRCFG=ON                                \
+```
+models/
+├── bin/
+│   └── powerserve-server
+├── lib/
+├── qnn_libs/
+├── qwen3-0.6b-base/
+├── qwen3-4b/
+├── qwen3-embedding-0.6b/
+└── qwen3-reranker-0.6b/
+```
+
+---
+
+## Build
+
+### Docker Build Environment
+
+Use your own Android/QNN cross-compilation image. For example:
+
+```bash
+docker run --rm -it \
+    -v "$(pwd):/workspace" \
+    -v "<path-to-models>:/models" \
+    -w /workspace \
+    <your-android-qnn-build-image> /bin/bash
+```
+
+Inside the container, set the environment variables above, then run the CMake commands below.
+
+### Android aarch64 with QNN
+
+Inside the Docker container:
+
+```bash
+cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-35 \
+    -DGGML_OPENMP=OFF \
+    -DPOWERSERVE_WITH_QNN=ON \
+    -DPOWERSERVE_ENABLE_HTPRPCPOLL=ON \
+    -DPOWERSERVE_ENABLE_HMXPWRCFG=ON \
     -DPOWERSERVE_USE_DUMMY=ON
 
 cmake --build build
 ```
 
+The server binary is `build/out/powerserve-server`.
 
-## Prepare PowerServe Workspace
+### CPU-only Server (optional)
 
-```shell
-# Under the root directory of PowerServe
-mkdir -p models
+Some test scripts expect a CPU-only binary named `powerserve-server-cpu`. Build it with QNN disabled:
 
-# Generate PowerServe Workspace
-./powerserve create -m ./llama3.1-8b-instruct-model --exe-path ./build/out -o ./models/llama3.1-8b-instruct
+```bash
+cmake -B build-cpu \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=arm64-v8a \
+    -DANDROID_PLATFORM=android-35 \
+    -DGGML_OPENMP=OFF \
+    -DPOWERSERVE_WITH_QNN=OFF \
+    -DPOWERSERVE_USE_DUMMY=ON
+
+cmake --build build-cpu
+cp build-cpu/out/powerserve-server build/out/powerserve-server-cpu
 ```
 
-## Execution
+### Build Notes
 
-### CLI
-More details please refer to [CLI App](./app/run/README.md)
+- The project links against an Android-format `libfaiss.so`, so **local x86 builds will fail at link time**. Always cross-compile for Android aarch64.
+- On some platforms (e.g., SA8295 / Hexagon V68), disable HTP RPC polling and HMX power config:
+  ```bash
+  -DPOWERSERVE_ENABLE_HTPRPCPOLL=OFF
+  -DPOWERSERVE_ENABLE_HMXPWRCFG=OFF
+  ```
+- `POWERSERVE_USE_DUMMY=ON` is recommended for SM8650/8750-class devices.
 
-For pure CPU execution
-```shell
-# Under the root directory of PowerServe
-./models/llama3.1-8b-instruct/bin/powerserve-run --work-folder ./models/llama3.1-8b-instruct --prompt "Once upon a time, there was a little girl named Lucy" --no-qnn
-```
-For NPU execution
-```shell
-# Under the root directory of PowerServe
-export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64 && ./models/llama3.1-8b-instruct/bin/powerserve-run --work-folder ./models/llama3.1-8b-instruct --prompt "Once upon a time, there was a little girl named Lucy"
+---
+
+## Deploy
+
+Push the server binary to the device:
+
+```bash
+adb push build/out/powerserve-server /data/local/tmp/<project>/models/bin/
 ```
 
-### Server
-More details please refer to [Server App](./app/server/README.md)
-```shell
-# Under the root directory of PowerServe
-export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64 && ./models/llama3.1-8b-instruct/bin/powerserve-server --work-folder ./models --host <ip-addr> --port <port>
+Start the server with the helper script:
+
+```bash
+# NPU mode
+./tests/run_server.sh npu
+
+# CPU-only mode (requires powerserve-server-cpu)
+./tests/run_server.sh cpu
 ```
+
+Or start it manually for full logs:
+
+```bash
+adb shell
+export LD_LIBRARY_PATH=/data/local/tmp/<project>/models/lib:/data/local/tmp/<project>/models/qnn_libs
+cd /data/local/tmp/<project>
+./models/bin/powerserve-server -d ./models --port 8080
+```
+
+---
+
+## How to Test
+
+### Single RAG Request
+
+```bash
+./tests/run_rag_once.sh npu_cpu
+```
+
+Supported profiles:
+
+| Profile | Mode | Prefill | Decode |
+|---------|------|---------|--------|
+| `pure_cpu_sequential` | `sequential` | cpu | cpu |
+| `pure_npu_sequential` | `sequential` | npu | npu |
+| `npu_cpu` | `hetero_parallel` | npu | cpu |
+| `npu_cpu_cs` | `npu_cpu_cs` | npu | cpu |
+| `carrier_baseline` | `carrier_baseline` | npu | cpu |
+
+### Workload Tests
+
+```bash
+./tests/run_rag_workload.sh 4K npu_cpu
+./tests/run_rag_workload.sh 8K npu_cpu_cs
+```
+
+Available workloads: `4K`, `6K`, `8K`, `10K`.
+
+### Benchmark
+
+```bash
+./tests/run_rag_benchmark.sh npu_cpu
+./tests/run_rag_benchmark.sh npu_cpu_cs
+```
+
+This runs all workloads and prints a per-stage timing table.
+
+### Environment Variable Overrides
+
+```bash
+RAG_EXPANSION_MODEL=qwen3-0.6b-base \
+RAG_GENERATION_MODEL=qwen3-4b \
+    ./tests/run_rag_workload.sh 4K npu_cpu
+
+RAG_TOP_N=10 \
+RAG_CANDIDATE_REPEATS=3 \
+    ./tests/run_rag_workload.sh 8K npu_cpu_cs
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `RAG_EXPANSION_MODEL` | Query expansion model |
+| `RAG_GENERATION_MODEL` | Answer generation model |
+| `RAG_TOP_N` | Number of chunks after reranking |
+| `RAG_CANDIDATE_REPEATS` | Repeat count per sub-query candidate |
+
+---
+
+## API Examples
+
+Forward the device port:
+
+```bash
+adb forward tcp:18080 tcp:8080
+```
+
+### RAG
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/rag \
+  -H "Content-Type: application/json" \
+  -d '{
+    "doc": "OpenAI was founded in 2015 ...",
+    "query": "What trade-offs has OpenAI made?",
+    "mode": "hetero_parallel",
+    "generation_prefill_backend": "npu",
+    "generation_decode_backend": "cpu",
+    "generation_model": "qwen3-4b",
+    "embedding_model": "qwen3-embedding-0.6b",
+    "rerank_model": "qwen3-reranker-0.6b",
+    "expansion_model": "qwen3-0.6b-base",
+    "enable_query_expansion": true,
+    "top_k": 20,
+    "top_n": 5,
+    "generation_decode_steps": 64,
+    "max_tokens": 64,
+    "temperature": 0.1
+  }'
+```
+
+Key response fields:
+
+```json
+{
+  "answer": "...",
+  "mode_requested": "hetero_parallel",
+  "mode_used": "hetero_parallel",
+  "stage_metrics_ms": {
+    "indexing": 5086,
+    "query_expand": 1115,
+    "query_embedding": 1242,
+    "embedding": 6054,
+    "searching": 16,
+    "reranking": 4401,
+    "generation": 26973,
+    "total": 30423
+  },
+  "debug": {
+    "generation_prefill_backend_target": "npu",
+    "generation_decode_backend_target": "cpu",
+    "generation_kv_bridge_available": true,
+    "generation_segmented_prefill_used": true,
+    "generation_sub_metrics": {
+      "prefill_ms": 2283,
+      "decode_ms": 26179,
+      "bridge_ms": 0,
+      "kv_snapshot_ms": 120,
+      "kv_restore_ms": 45,
+      "kv_snapshot_bytes": 36700160
+    }
+  }
+}
+```
+
+### Completions
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-0.6b-base",
+    "prompt": "Briefly introduce OpenAI.",
+    "max_tokens": 128,
+    "temperature": 0.2
+  }'
+```
+
+### Chat Completions
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-0.6b-base",
+    "messages": [
+      {"role": "user", "content": "Briefly introduce OpenAI."}
+    ],
+    "max_tokens": 128,
+    "temperature": 0.2
+  }'
+```
+
+### Embeddings
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-embedding-0.6b",
+    "input": "When was OpenAI founded?"
+  }'
+```
+
+### Rerank
+
+```bash
+curl -sS -X POST http://127.0.0.1:18080/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3-reranker-0.6b",
+    "query": "When was OpenAI founded?",
+    "documents": [
+      "OpenAI was founded in 2015.",
+      "GPT-4 was released in 2023."
+    ],
+    "top_n": 2
+  }'
+```
+
+---
 
 ## Known Issues
+- **Embedding NPU hybrid path is experimental**: Qwen3 embedding supports a QNN backbone + CPU finalization path, but numerical precision issues may still exist.
 
-### Execution
-
-1. **When inferencing with QNN**: Failed to open lib /vendor/lib64/libcdsprpc.so: dlopen failed: library "/vendor/lib64/libcdsprpc.so" needed or dlopened by "/data/data/com.termux/files/home/workspace/qnn/llama-3.2-1b-instruct/bin/powerserve-run" is not accessible for the namespace "(default)
-
-    > Use `export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64` before executing the program.
-    >
-    > Because `libcdsprpc.so` depends on `/system/lib64/libbinder.so` instead of `/vendor/lib64/libbinder.so`. If the linker searches the `/vendor/lib64` at first, it may find and links `/vendor/lib64/libbinder.so` which does not contain corresponding function definitions.
-
-2. **Some mobile phones cannot run large models**: Some mobile phones cannot run larger models due to different security policies.
-
-    **Some of known models and phones are listed below:**
-
-    | Phone    | Models can't be run |
-    |----------|---------------------|
-    | All smartphones of HONOR | LLMs larger than 3B |
-
-## Release Notes
-
-[2025/4/22] Bug fixes, more debug tools, backward compatability and more QOL updates.
-
-### Bug fixes
-
-- Fixed a bug that caused the GGUF model loading failure due to the 32-bit system `size_t` overflow.
-- Specify protobuf and pytorch versions in `./tools/qnn_converter/requirements.txt` for support of large models.
-- QNN converter's `--n-threads` flag (defaults to 4) now can also control the maximum thread number of all converting phases
-- QNN converter's library build logs now can be correctly generated across the build directories
-
-### Debug tools
-
-- Tensor dump: Added a debug tool to dump the tensor data in the model. This is useful for debugging and verifying the correctness of the model. To enable the tool, compile the executable with `-DPOWERSERVE_DUMP_TENSORS=ON`. The tensor data is dumped in text format, the format of data is configurable in the source code.
-
-### Backward compatibility
-
-- Added backward compatibility for the SA8295 (Hexagon V68). To run the framework on SA8295, compile the executable with `-DPOWERSERVE_ENABLE_HTPRPCPOLL=OFF` and `-DPOWERSERVE_ENABLE_HMXPWRCFG=OFF`. This is required because the SA8295 does not support these performance configurations.
-
-## QOL updates
-
-- Added several prompt files with instruction templates integrated with the prompt
-- Added `--embd-only` commandline flag to the `convert_hf_to_gguf.py` script to extract only the embedding part of the model, to minimize the disk and memory usage in NPU-only inference scenarios
-- Added `./tools/convert_hf_to_gguf/llama-quantize-x86_64-clang`, an instance of `llama-quantize` executable used for quantizing f32 gguf models into q4 but skips the model completeness check in the original llama.cpp. To quantize a embedding-only gguf model, you need to use this special executable (or skip the sanity check by yourself in llama.cpp).
-- Added end-to-end parameter search from host feature, which is suitable for devices without python environment. All parameter search tools now require the framework executable built with `-DPOWERSERVE_DUMP_SPEEDINFO=ON` to enable the executable to dump speculative tree info / speed info to the file specified in environment variable `dump_file`.
-- Added `--silent` flag to hide the commandline arguments for the qualcomm converter tools
-- Added `--clear-build-files` flag to automatically clear the intermediate build files after build (and also slightly reduces the peak disk usage)
-- `--soc` flag now receives the SoC number (for example, 8650 for Snapdragon 8 Gen 3, 8750 for Snapdragon 8 Elite, 8295 for Automotive SA8295) instead of abbreviation of the SoC to avoid confusion
-- Added spinquant models' export parameters
-- Specified hardware requirements to convert qnn models
-- Added `POWERSERVE_USE_DUMMY` flag to let users decide whether to use dummy buffers to help allocate NPU buffers, should be enabled on SM8650/8750 and disabled on SA8295.
